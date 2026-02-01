@@ -1,5 +1,6 @@
 from .core import AutomationEngine
 from .capture import ScreenCapture
+from .debug_draw import draw_match_rect, draw_verification_results
 from .detector import FeatureDetector, TemplateDetector, RoiDeltaDetector, parse_pixel_points, pixel_points_check
 from .mapper import (
     find_window,
@@ -13,6 +14,8 @@ from .mapper import (
 __all__ = [
     "AutomationEngine",
     "ScreenCapture",
+    "draw_match_rect",
+    "draw_verification_results",
     "TemplateDetector",
     "FeatureDetector",
     "RoiDeltaDetector",

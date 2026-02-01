@@ -20,11 +20,34 @@ class PixelPoint:
     tolerance: int
 
 
-def parse_pixel_points(raw: Optional[Iterable[dict]]) -> list[PixelPoint]:
+def parse_pixel_points(raw: Optional[Iterable[object]]) -> list[PixelPoint]:
     points: list[PixelPoint] = []
     if not raw:
         return points
     for item in raw:
+        if isinstance(item, PixelPoint):
+            points.append(item)
+            continue
+        if isinstance(item, (list, tuple)):
+            if len(item) != 4:
+                continue
+            x, y, rgb, tolerance = item
+            if not isinstance(rgb, (list, tuple)) or len(rgb) != 3:
+                continue
+            try:
+                r, g, b = rgb
+                point = PixelPoint(
+                    x=int(x),
+                    y=int(y),
+                    rgb=(int(r), int(g), int(b)),
+                    tolerance=int(tolerance),
+                )
+            except Exception:
+                continue
+            points.append(point)
+            continue
+        if not isinstance(item, dict):
+            continue
         if "rgb" in item and isinstance(item["rgb"], (list, tuple)) and len(item["rgb"]) == 3:
             r, g, b = item["rgb"]
         else:
@@ -46,17 +69,31 @@ class TemplateDetector:
     def __init__(self, template_path: str) -> None:
         self.template_path = template_path
         self._template_gray: Optional[np.ndarray] = None
+        self._template_bgr: Optional[np.ndarray] = None
         self._template_mask: Optional[np.ndarray] = None
+        self._last_use_bgr: Optional[bool] = None
+        self._last_mask_used: Optional[bool] = None
+        self._last_method: Optional[str] = None
+        self._last_scales: Optional[int] = None
+        self._last_range: Optional[float] = None
         self._missing_logged = False
         self._scaled_cache: dict[Tuple[int, int], Tuple[np.ndarray, Optional[np.ndarray]]] = {}
+        self._scaled_bgr_cache: dict[Tuple[int, int], Tuple[np.ndarray, Optional[np.ndarray]]] = {}
         self._load_template()
 
     def reload(self, template_path: Optional[str] = None) -> None:
         if template_path:
             self.template_path = template_path
         self._template_gray = None
+        self._template_bgr = None
         self._template_mask = None
+        self._last_use_bgr = None
+        self._last_mask_used = None
+        self._last_method = None
+        self._last_scales = None
+        self._last_range = None
         self._scaled_cache.clear()
+        self._scaled_bgr_cache.clear()
         self._missing_logged = False
         self._load_template()
 
@@ -71,14 +108,18 @@ class TemplateDetector:
         if raw.ndim == 3 and raw.shape[2] == 4:
             bgr = raw[:, :, :3]
             alpha = raw[:, :, 3]
+            self._template_bgr = bgr
             self._template_gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
             self._template_mask = (alpha > 0).astype(np.uint8) * 255
-            logging.info("Loaded template with alpha mask: %s", self.template_path)
+            logging.info("Loaded BGRA template (BGR matching enabled): %s", self.template_path)
         elif raw.ndim == 3:
+            self._template_bgr = raw
             self._template_gray = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY)
+            logging.info("Loaded BGR template (BGR matching enabled): %s", self.template_path)
         else:
+            self._template_bgr = None
             self._template_gray = raw
-        logging.info("Loaded template: %s", self.template_path)
+            logging.info("Loaded grayscale template (grayscale matching): %s", self.template_path)
 
     def _get_scaled_template(
         self, scale_x: float, scale_y: float
@@ -102,47 +143,119 @@ class TemplateDetector:
         self._scaled_cache[key] = (resized, mask)
         return resized, mask
 
-    def match(self, image_bgr: np.ndarray, scale_x: float = 1.0, scale_y: float = 1.0) -> float:
-        if self._template_gray is None:
-            if not self._missing_logged:
-                logging.warning("Template missing or unreadable: %s", self.template_path)
-                self._missing_logged = True
-            return 0.0
-        try:
-            image_gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-        except Exception:
-            return 0.0
-        template, mask = self._get_scaled_template(scale_x, scale_y)
-        if template is None:
-            return 0.0
-        t_h, t_w = template.shape[:2]
-        i_h, i_w = image_gray.shape[:2]
-        if t_h > i_h or t_w > i_w:
-            return 0.0
-        score, _loc, _second = self._match_with_location(image_gray, template, mask)
+    def _get_scaled_bgr(
+        self, scale_x: float, scale_y: float
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if self._template_bgr is None:
+            return None, None
+        t_h, t_w = self._template_bgr.shape[:2]
+        target_w = max(1, int(round(t_w * scale_x)))
+        target_h = max(1, int(round(t_h * scale_y)))
+        if target_w == t_w and target_h == t_h:
+            return self._template_bgr, self._template_mask
+        key = (target_w, target_h)
+        cached = self._scaled_bgr_cache.get(key)
+        if cached is not None:
+            return cached
+        interp = cv2.INTER_AREA if target_w < t_w or target_h < t_h else cv2.INTER_LINEAR
+        resized = cv2.resize(self._template_bgr, (target_w, target_h), interpolation=interp)
+        mask = None
+        if self._template_mask is not None:
+            mask = cv2.resize(self._template_mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        self._scaled_bgr_cache[key] = (resized, mask)
+        return resized, mask
+
+    def match(
+        self, image_bgr: np.ndarray, scale_x: float = 1.0, scale_y: float = 1.0,
+        multi_scale_range: float = 0.0, multi_scale_steps: int = 0,
+    ) -> float:
+        score, _loc, _size, _second = self.match_with_location(
+            image_bgr, scale_x, scale_y,
+            multi_scale_range=multi_scale_range,
+            multi_scale_steps=multi_scale_steps,
+        )
         return float(score)
 
     def match_with_location(
-        self, image_bgr: np.ndarray, scale_x: float = 1.0, scale_y: float = 1.0
+        self, image_bgr: np.ndarray, scale_x: float = 1.0, scale_y: float = 1.0,
+        multi_scale_range: float = 0.0, multi_scale_steps: int = 0,
     ) -> Tuple[float, Optional[Tuple[int, int]], Optional[Tuple[int, int]], Optional[float]]:
         if self._template_gray is None:
             if not self._missing_logged:
                 logging.warning("Template missing or unreadable: %s", self.template_path)
                 self._missing_logged = True
             return 0.0, None, None, None
-        try:
-            image_gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-        except Exception:
+
+        # Build scale offsets for multi-scale search
+        if multi_scale_steps > 0 and multi_scale_range > 0.0:
+            offsets = [
+                multi_scale_range * i / multi_scale_steps
+                for i in range(-multi_scale_steps, multi_scale_steps + 1)
+            ]
+        else:
+            offsets = [0.0]
+
+        # Decide matching mode: BGR if template has color data, else grayscale
+        use_bgr = self._template_bgr is not None
+        logging.debug("match_with_location: use_bgr=%s, scales=%d, range=%.3f", use_bgr, len(offsets), multi_scale_range)
+        self._last_use_bgr = use_bgr
+        self._last_scales = len(offsets)
+        self._last_range = float(multi_scale_range)
+        self._last_mask_used = self._template_mask is not None
+        self._last_method = "TM_CCORR_NORMED" if self._last_mask_used else "TM_CCOEFF_NORMED"
+
+        if use_bgr:
+            match_image = image_bgr
+        else:
+            try:
+                match_image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+            except Exception:
+                return 0.0, None, None, None
+
+        i_h, i_w = match_image.shape[:2]
+
+        best_score = 0.0
+        best_loc: Optional[Tuple[int, int]] = None
+        best_size: Optional[Tuple[int, int]] = None
+        best_second: Optional[float] = None
+
+        for offset in offsets:
+            adj_sx = scale_x * (1.0 + offset)
+            adj_sy = scale_y * (1.0 + offset)
+
+            if use_bgr:
+                template, mask = self._get_scaled_bgr(adj_sx, adj_sy)
+            else:
+                template, mask = self._get_scaled_template(adj_sx, adj_sy)
+
+            if template is None:
+                continue
+
+            t_h, t_w = template.shape[:2]
+            if t_h > i_h or t_w > i_w:
+                continue
+
+            score, loc, second_best = self._match_with_location(match_image, template, mask)
+
+            if score > best_score:
+                best_score = score
+                best_loc = loc
+                best_size = (t_w, t_h)
+                best_second = second_best
+
+        if best_loc is None:
             return 0.0, None, None, None
-        template, mask = self._get_scaled_template(scale_x, scale_y)
-        if template is None:
-            return 0.0, None, None, None
-        t_h, t_w = template.shape[:2]
-        i_h, i_w = image_gray.shape[:2]
-        if t_h > i_h or t_w > i_w:
-            return 0.0, None, None, None
-        score, loc, second_best = self._match_with_location(image_gray, template, mask)
-        return float(score), loc, (t_w, t_h), float(second_best)
+
+        return float(best_score), best_loc, best_size, float(best_second) if best_second is not None else None
+
+    def last_match_debug(self) -> dict[str, object]:
+        return {
+            "use_bgr": self._last_use_bgr,
+            "mask": self._last_mask_used,
+            "method": self._last_method,
+            "scales": self._last_scales,
+            "range": self._last_range,
+        }
 
     @staticmethod
     def _match_with_location(
@@ -340,6 +453,65 @@ def pixel_points_check(
             matches += 1
     score = matches / len(points_list)
     return matches == len(points_list), float(score)
+
+
+def pixel_points_check_with_results(
+    points: Iterable[PixelPoint],
+    marker_roi_bgr: np.ndarray,
+    marker_roi_screen_rect: Tuple[int, int, int, int],
+    ref_size: Tuple[int, int],
+    client_origin: Tuple[int, int],
+    client_size: Tuple[int, int],
+    capture: ScreenCapture,
+) -> Tuple[bool, float, list[dict[str, object]]]:
+    points_list = list(points)
+    if not points_list:
+        return False, 0.0, []
+    matches = 0
+    results: list[dict[str, object]] = []
+    left, top, _width, _height = marker_roi_screen_rect
+    for point in points_list:
+        screen_x, screen_y = map_point((point.x, point.y), ref_size, client_origin, client_size)
+        abs_x = int(round(screen_x - left))
+        abs_y = int(round(screen_y - top))
+        sample_rgb = _sample_point_from_roi(
+            marker_roi_bgr,
+            marker_roi_screen_rect,
+            (screen_x, screen_y),
+        )
+        if sample_rgb is None:
+            pixel_img = capture.grab((screen_x, screen_y, 1, 1))
+            if pixel_img is None or pixel_img.size == 0:
+                results.append(
+                    {
+                        "abs_pos": (abs_x, abs_y),
+                        "passed": False,
+                        "sample": 0,
+                        "match_pos": None,
+                        "ref_pos": (int(point.x), int(point.y)),
+                        "expected": (int(point.rgb[0]), int(point.rgb[1]), int(point.rgb[2])),
+                        "tolerance": int(point.tolerance),
+                    }
+                )
+                continue
+            b, g, r = pixel_img[0, 0]
+            sample_rgb = (int(r), int(g), int(b))
+        passed = _within_tolerance(sample_rgb, point.rgb, point.tolerance)
+        if passed:
+            matches += 1
+        results.append(
+            {
+                "abs_pos": (abs_x, abs_y),
+                "passed": passed,
+                "sample": 0,
+                "match_pos": (abs_x, abs_y) if passed else None,
+                "ref_pos": (int(point.x), int(point.y)),
+                "expected": (int(point.rgb[0]), int(point.rgb[1]), int(point.rgb[2])),
+                "tolerance": int(point.tolerance),
+            }
+        )
+    score = matches / len(points_list)
+    return matches == len(points_list), float(score), results
 
 
 class RoiDeltaDetector:

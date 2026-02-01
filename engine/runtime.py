@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ctypes
+import inspect
 import json
 import os
 import sys
 import threading
 import time
-from typing import Iterable, Tuple
+from typing import Callable, Iterable, Tuple
 
 import keyboard
 import pydirectinput
@@ -51,6 +53,13 @@ _debug_log_enabled: bool | None = None
 _debug_log_mtime: float | None = None
 _debug_log_path: str | None = None
 _focused_once = False
+_global_hotkey_poll_enabled: bool | None = None
+_global_hotkey_thread: threading.Thread | None = None
+_global_hotkey_stop = threading.Event()
+_global_hotkey_lock = threading.Lock()
+_global_hotkeys: dict[str, tuple[set[str], int]] = {}
+_global_hotkey_state: dict[str, bool] = {}
+_global_hotkey_callbacks: dict[str, Callable[[], None]] = {}
 
 DEFAULT_TIMEOUT_S = 1000.0
 DEFAULT_STEP_DELAY_S = 1.0
@@ -140,6 +149,20 @@ def _log_action(message: str) -> None:
         print(f"[runtime] {message}", flush=True)
 
 
+def _caller_context(action: str) -> dict[str, object]:
+    runtime_path = os.path.abspath(__file__)
+    for frame_info in inspect.stack()[2:]:
+        filename = os.path.abspath(frame_info.filename)
+        if filename != runtime_path:
+            return {
+                "action": action,
+                "caller_file": filename,
+                "caller_line": int(frame_info.lineno),
+                "caller_func": frame_info.function,
+            }
+    return {"action": action}
+
+
 def _format_match(match: object) -> tuple[str, str, str, str, str]:
     score_text = "n/a"
     delta_text = "n/a"
@@ -183,6 +206,7 @@ def _locate_match(
     radius: int | None,
     roi_ref: Tuple[int, int, int, int] | None,
     min_score_delta: float | None = None,
+    debug_context: dict[str, object] | None = None,
 ):
     engine = _ensure_engine()
     image_path = _resolve_path(image_name)
@@ -194,6 +218,7 @@ def _locate_match(
         use_default_threshold=use_default_threshold,
         roi_ref=roi,
         min_score_delta=min_score_delta,
+        debug_context=debug_context,
     )
 
 
@@ -209,12 +234,156 @@ def _near_to_roi(near: Tuple[int, int] | None, radius: int | None) -> Tuple[int,
     return (x, y, w, h)
 
 
+def _vk_from_key_name(key: str) -> int | None:
+    cleaned = key.strip().lower()
+    if not cleaned or "+" in cleaned:
+        return None
+    if len(cleaned) == 1 and cleaned.isalnum():
+        return ord(cleaned.upper())
+    if cleaned.startswith("f") and cleaned[1:].isdigit():
+        number = int(cleaned[1:])
+        if 1 <= number <= 24:
+            return 0x70 + (number - 1)
+    aliases = {
+        "esc": 0x1B,
+        "escape": 0x1B,
+        "space": 0x20,
+        "tab": 0x09,
+        "enter": 0x0D,
+    }
+    return aliases.get(cleaned)
+
+
+def _key_is_down(vk: int) -> bool:
+    return bool(ctypes.windll.user32.GetAsyncKeyState(int(vk)) & 0x8000)
+
+
+def _parse_hotkey(hotkey: str) -> tuple[set[str], int] | None:
+    cleaned = hotkey.strip().lower().replace(" ", "")
+    if not cleaned:
+        return None
+    parts = [part for part in cleaned.split("+") if part]
+    if not parts:
+        return None
+    modifiers: set[str] = set()
+    key_name: str | None = None
+    for part in parts:
+        if part in {"ctrl", "control"}:
+            modifiers.add("ctrl")
+        elif part == "shift":
+            modifiers.add("shift")
+        elif part == "alt":
+            modifiers.add("alt")
+        elif part in {"win", "windows", "cmd", "command"}:
+            modifiers.add("win")
+        else:
+            if key_name is not None:
+                return None
+            key_name = part
+    if key_name is None:
+        return None
+    vk = _vk_from_key_name(key_name)
+    if vk is None:
+        return None
+    return modifiers, vk
+
+
+def _modifiers_down(modifiers: set[str]) -> bool:
+    if "ctrl" in modifiers and not _key_is_down(0x11):
+        return False
+    if "shift" in modifiers and not _key_is_down(0x10):
+        return False
+    if "alt" in modifiers and not _key_is_down(0x12):
+        return False
+    if "win" in modifiers and not (_key_is_down(0x5B) or _key_is_down(0x5C)):
+        return False
+    return True
+
+
+def _global_hotkey_poll_enabled_now() -> bool:
+    global _global_hotkey_poll_enabled
+    if _global_hotkey_poll_enabled is not None:
+        return _global_hotkey_poll_enabled
+    override = os.environ.get("SEIA_GLOBAL_HOTKEY_POLL")
+    if override is not None:
+        _global_hotkey_poll_enabled = override.strip().lower() in {"1", "true", "yes", "on"}
+        return _global_hotkey_poll_enabled
+    path = _get_config_path()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except Exception:
+        _global_hotkey_poll_enabled = False
+        return _global_hotkey_poll_enabled
+    runtime_cfg = config.get("runtime", {})
+    if isinstance(runtime_cfg, dict) and "global_key_poll" in runtime_cfg:
+        _global_hotkey_poll_enabled = bool(runtime_cfg.get("global_key_poll", False))
+        return _global_hotkey_poll_enabled
+    _global_hotkey_poll_enabled = bool(config.get("test_input", {}).get("global_key_poll", False))
+    return _global_hotkey_poll_enabled
+
+
+def _start_global_hotkey_thread() -> None:
+    global _global_hotkey_thread
+    if _global_hotkey_thread is not None and _global_hotkey_thread.is_alive():
+        return
+
+    def _poll_loop() -> None:
+        while not _global_hotkey_stop.is_set():
+            callbacks: list[Callable[[], None]] = []
+            with _global_hotkey_lock:
+                for action, (modifiers, vk) in _global_hotkeys.items():
+                    is_down = _modifiers_down(modifiers) and _key_is_down(vk)
+                    was_down = _global_hotkey_state.get(action, False)
+                    if is_down and not was_down:
+                        callback = _global_hotkey_callbacks.get(action)
+                        if callback is not None:
+                            callbacks.append(callback)
+                    _global_hotkey_state[action] = is_down
+            for callback in callbacks:
+                try:
+                    callback()
+                except Exception:
+                    pass
+            time.sleep(0.02)
+
+    _global_hotkey_stop.clear()
+    _global_hotkey_thread = threading.Thread(target=_poll_loop, name="runtime-hotkey-poll", daemon=True)
+    _global_hotkey_thread.start()
+
+
+def _register_global_hotkey(action: str, hotkey: str, callback: Callable[[], None]) -> bool:
+    parsed = _parse_hotkey(hotkey)
+    if parsed is None:
+        return False
+    with _global_hotkey_lock:
+        _global_hotkeys[action] = parsed
+        _global_hotkey_callbacks[action] = callback
+        _global_hotkey_state[action] = False
+    _start_global_hotkey_thread()
+    return True
+
+
 def hotkey_stop(key: str = "F10") -> None:
+    if _global_hotkey_poll_enabled_now():
+        if _register_global_hotkey("stop", key, _stop_event.set):
+            return
     keyboard.add_hotkey(key, _stop_event.set)
 
 
 def hotkey_restart(key: str = "F5") -> None:
+    if _global_hotkey_poll_enabled_now():
+        if _register_global_hotkey("restart", key, _restart_event.set):
+            return
     keyboard.add_hotkey(key, _restart_event.set)
+
+
+def hotkey_callback(key: str, callback: Callable[[], None], name: str | None = None) -> None:
+    if _global_hotkey_poll_enabled_now():
+        action = name or f"callback_{id(callback)}"
+        if _register_global_hotkey(action, key, callback):
+            return
+    keyboard.add_hotkey(key, callback)
 
 
 def stop_requested() -> bool:
@@ -227,6 +396,9 @@ def reset_stop() -> None:
 
 def cleanup() -> None:
     keyboard.unhook_all_hotkeys()
+    _global_hotkey_stop.set()
+    if _global_hotkey_thread is not None and _global_hotkey_thread.is_alive():
+        _global_hotkey_thread.join(timeout=0.5)
 
 
 def sleep(seconds: float) -> None:
@@ -300,15 +472,15 @@ def action(
     near: Tuple[int, int] | None = None,
     radius: int | None = None,
     roi_ref: Tuple[int, int, int, int] | None = None,
-    verify_pixels: list[Tuple[int, int, Tuple[int, int, int], int]] | None = None,
+    verify_pixels: list[tuple] | None = None,
 ) -> bool:
     if stop_requested():
         raise SystemExit(0)
-    
+
     # Add pixel verification if provided
     if verify_pixels:
         add_pixel_verification(image_name, verify_pixels)
-    
+
     engine = _ensure_engine()
     image_path = _resolve_path(image_name)
     if not os.path.exists(image_path):
@@ -324,6 +496,7 @@ def action(
         f"near={near} radius={radius} "
         f"min_delta={min_delta:.3f}"
     )
+    debug_context = _caller_context("action")
     match = engine.action_with_match(
         image_path,
         coords_offset=coords_offset,
@@ -332,6 +505,7 @@ def action(
         roi_ref=roi_ref,
         use_default_threshold=use_default_threshold,
         stop_check=stop_requested,
+        debug_context=debug_context,
     )
     if stop_requested():
         raise SystemExit(0)
@@ -376,9 +550,40 @@ def present(
     if not os.path.exists(image_path):
         _fail(f"Image not found: {image_path}")
     roi_ref = roi_ref if roi_ref is not None else _near_to_roi(near, radius)
-    ok = engine.image_present(image_path, use_default_threshold=use_default_threshold, roi_ref=roi_ref)
+    debug_context = _caller_context("present")
+    ok = engine.image_present(
+        image_path,
+        use_default_threshold=use_default_threshold,
+        roi_ref=roi_ref,
+        debug_context=debug_context,
+    )
     if log:
         _log_action(f"present image={image_name} ok={int(ok)}")
+    return ok
+
+
+def verify_pixels(
+    points: Iterable[object],
+    roi_ref: Tuple[int, int, int, int] | None = None,
+    require: bool = False,
+    log: bool = True,
+) -> bool:
+    """
+    Verify pixel colors directly using reference-space coordinates.
+
+    Args:
+        points: Iterable of pixel points (PixelPoint, dict, or tuple forms).
+        roi_ref: Optional ROI in reference coords to limit capture.
+        require: If True, raise on failure.
+        log: If True, emit debug log line.
+    """
+    engine = _ensure_engine()
+    debug_context = _caller_context("verify_pixels")
+    ok, score = engine.verify_pixels(points, roi_ref=roi_ref, debug_context=debug_context)
+    if log:
+        _log_action(f"verify_pixels ok={int(ok)} score={score:.2f}")
+    if require and not ok:
+        _fail("Pixel verification failed")
     return ok
 
 
@@ -391,7 +596,7 @@ def wait_for(
     near: Tuple[int, int] | None = None,
     radius: int | None = None,
     roi_ref: Tuple[int, int, int, int] | None = None,
-    verify_pixels: list[Tuple[int, int, Tuple[int, int, int], int]] | None = None,
+    verify_pixels: list[tuple] | None = None,
 ) -> bool:
     _log_action(
         "wait_for "
@@ -399,7 +604,8 @@ def wait_for(
         f"timeout={float(timeout_s):.2f}s "
         f"step_delay={float(step_delay_s):.2f}s"
     )
-    
+    debug_context = _caller_context("wait_for")
+
     # Add pixel verification if provided
     if verify_pixels:
         add_pixel_verification(image_name, verify_pixels)
@@ -415,6 +621,7 @@ def wait_for(
             radius=radius,
             roi_ref=roi_ref,
             min_score_delta=None,
+            debug_context=debug_context,
         )
         if match is not None:
             score_text, delta_text, ref_text, screen_text, extra_text = _format_match(match)
@@ -452,6 +659,7 @@ def wait_for_image_optional(
         f"timeout={float(timeout_s):.2f}s "
         f"step_delay={float(step_delay_s):.2f}s"
     )
+    debug_context = _caller_context("wait_for_optional")
     deadline = time.monotonic() + max(0.0, timeout_s)
     while True:
         if stop_requested():
@@ -463,6 +671,7 @@ def wait_for_image_optional(
             radius=radius,
             roi_ref=roi_ref,
             min_score_delta=None,
+            debug_context=debug_context,
         )
         if match is not None:
             score_text, delta_text, ref_text, screen_text, extra_text = _format_match(match)
@@ -499,6 +708,7 @@ def wait_for_absent(
         f"timeout={float(timeout_s):.2f}s "
         f"step_delay={float(step_delay_s):.2f}s"
     )
+    debug_context = _caller_context("wait_for_absent")
     deadline = time.monotonic() + max(0.0, timeout_s)
     last_match = None
     while True:
@@ -511,6 +721,7 @@ def wait_for_absent(
             radius=radius,
             roi_ref=roi_ref,
             min_score_delta=None,
+            debug_context=debug_context,
         )
         if match is None:
             print(_colored(f"[runtime] ✓ wait_for_absent result image={image_name} ok=1", Color.GREEN + Color.BOLD), flush=True)
@@ -551,6 +762,7 @@ def wait_for_absent_optional(
         f"timeout={float(timeout_s):.2f}s "
         f"step_delay={float(step_delay_s):.2f}s"
     )
+    debug_context = _caller_context("wait_for_absent_optional")
     deadline = time.monotonic() + max(0.0, timeout_s)
     last_match = None
     while True:
@@ -563,6 +775,7 @@ def wait_for_absent_optional(
             radius=radius,
             roi_ref=roi_ref,
             min_score_delta=None,
+            debug_context=debug_context,
         )
         if match is None:
             print(_colored(f"[runtime] ✓ wait_for_absent_optional result image={image_name} ok=1", Color.GREEN + Color.BOLD), flush=True)
@@ -595,10 +808,10 @@ def press_until(
     near: Tuple[int, int] | None = None,
     radius: int | None = None,
     roi_ref: Tuple[int, int, int, int] | None = None,
-    verify_pixels: list[Tuple[int, int, Tuple[int, int, int], int]] | None = None,
+    verify_pixels: list[tuple] | None = None,
 ) -> bool:
     key_list = list(keys)
-    
+
     # Add pixel verification if provided
     if verify_pixels:
         add_pixel_verification(image_name, verify_pixels)
@@ -610,6 +823,7 @@ def press_until(
         f"timeout={float(timeout_s):.2f}s "
         f"step_delay={float(step_delay_s):.2f}s"
     )
+    debug_context = _caller_context("press_until")
     deadline = time.monotonic() + max(0.0, timeout_s)
     while True:
         if stop_requested():
@@ -621,6 +835,7 @@ def press_until(
             radius=radius,
             roi_ref=roi_ref,
             min_score_delta=None,
+            debug_context=debug_context,
         )
         if match is not None:
             score_text, delta_text, ref_text, screen_text, extra_text = _format_match(match)
@@ -665,6 +880,7 @@ def press_until_optional(
         f"timeout={float(timeout_s):.2f}s "
         f"step_delay={float(step_delay_s):.2f}s"
     )
+    debug_context = _caller_context("press_until_optional")
     deadline = time.monotonic() + max(0.0, timeout_s)
     while True:
         if stop_requested():
@@ -676,6 +892,7 @@ def press_until_optional(
             radius=radius,
             roi_ref=roi_ref,
             min_score_delta=None,
+            debug_context=debug_context,
         )
         if match is not None:
             score_text, delta_text, ref_text, screen_text, extra_text = _format_match(match)

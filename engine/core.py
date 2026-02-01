@@ -14,7 +14,13 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import pydirectinput
 
 from .capture import ScreenCapture
-from .detector import FeatureDetector, TemplateDetector
+from .detector import (
+    FeatureDetector,
+    TemplateDetector,
+    parse_pixel_points,
+    pixel_points_check,
+    pixel_points_check_with_results,
+)
 from .mapper import (
     find_window,
     get_client_origin_and_size,
@@ -22,8 +28,15 @@ from .mapper import (
     map_rect,
     focus_window,
     set_process_dpi_awareness,
+    set_window_client_size,
 )
-from .verify import verify_match, add_pixel_verification, get_last_failed_offset, get_last_verified_points
+from .debug_draw import draw_match_rect, draw_verification_results
+from .verify import (
+    verify_match,
+    add_pixel_verification,
+    get_last_failed_offset,
+    get_last_verification_results,
+)
 
 
 def _get_cursor_pos() -> Tuple[int, int]:
@@ -31,6 +44,32 @@ def _get_cursor_pos() -> Tuple[int, int]:
     if ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
         return int(point.x), int(point.y)
     return 0, 0
+
+
+def _to_list(value: Optional[Tuple[int, int] | Tuple[int, int, int] | Tuple[int, int, int, int]]) -> Optional[list[int]]:
+    if value is None:
+        return None
+    return [int(v) for v in value]
+
+
+def _serialize_results(results: list[dict[str, object]]) -> list[dict[str, object]]:
+    serialized: list[dict[str, object]] = []
+    for result in results:
+        serialized.append(
+            {
+                "abs_pos": _to_list(result.get("abs_pos")),
+                "rel_pos": _to_list(result.get("rel_pos")),
+                "ref_pos": _to_list(result.get("ref_pos")),
+                "expected": _to_list(result.get("expected")),
+                "actual": _to_list(result.get("actual")),
+                "tolerance": int(result.get("tolerance") or 0),
+                "passed": bool(result.get("passed")),
+                "sample": int(result.get("sample") or 0),
+                "match_pos": _to_list(result.get("match_pos")),
+                "is_global": bool(result.get("is_global")) if "is_global" in result else None,
+            }
+        )
+    return serialized
 
 
 @dataclass(frozen=True)
@@ -58,7 +97,20 @@ class AutomationEngine:
         self._use_pixel_verification = False
         self._debug_screenshot = False
         self._debug_output_dir = "debug_out"
+        self._debug_always_capture = False
+        self._debug_keep_history = False
+        self._capture_method = "screen"
+        self._auto_resize = False
+        self._resized_once = False
         self._load_config()
+
+    def _write_debug_meta(self, debug_path: str, meta: dict[str, object]) -> None:
+        try:
+            meta_path = f"{debug_path}.json"
+            with open(meta_path, "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, indent=2, ensure_ascii=True)
+        except Exception as exc:
+            logging.debug("Failed to save debug metadata: %s", exc)
 
     def _load_config(self) -> None:
         if not os.path.exists(self.config_path):
@@ -71,10 +123,14 @@ class AutomationEngine:
         ref = self._config.get("reference_resolution", {})
         self._ref_size = (int(ref.get("w", 1920)), int(ref.get("h", 1080)))
         self._render_cfg = self._config.get("render_area", {"mode": "stretch"})
+        window_cfg = self._config.get("window", {})
+        self._auto_resize = bool(window_cfg.get("auto_resize", False))
         marker_cfg = self._config.get("marker_detection", {})
         self._default_threshold = float(marker_cfg.get("threshold", 0.85))
         self._default_min_score_delta = float(marker_cfg.get("min_score_delta", 0.0))
         self._use_pixel_verification = bool(marker_cfg.get("use_pixel_verification", False))
+        self._multi_scale_range = float(marker_cfg.get("multi_scale_range", 0.03))
+        self._multi_scale_steps = int(marker_cfg.get("multi_scale_steps", 3))
         self._detector_method = str(marker_cfg.get("method", "template")).lower()
         if self._detector_method not in {"template", "feature"}:
             self._detector_method = "template"
@@ -89,20 +145,61 @@ class AutomationEngine:
         self._debug_screenshot = bool(debug_cfg.get("screenshot", False))
         debug_output = debug_cfg.get("output_dir", "debug_out")
         self._debug_output_dir = str(debug_output) if debug_output else "debug_out"
+        self._debug_always_capture = bool(debug_cfg.get("always_capture", False))
+        self._debug_keep_history = bool(debug_cfg.get("keep_history", False))
+        capture_cfg = self._config.get("capture", {})
+        capture_method = str(capture_cfg.get("method", "auto")).lower()
+        if capture_method not in {"auto", "screen", "window"}:
+            capture_method = "auto"
+        self._capture_method = capture_method
         poll_ms = self._config.get("poll_interval_ms", 50)
         self._poll_interval = max(0.01, float(poll_ms) / 1000.0)
+
+    def _debug_path(self, debug_dir: str, prefix: str, image_filename: str) -> str:
+        if self._debug_keep_history:
+            stamp = int(time.time() * 1000)
+            name = f"{prefix}_{stamp}_{image_filename}"
+        else:
+            name = f"{prefix}_{image_filename}"
+        return os.path.join(debug_dir, name)
 
     def reload(self) -> None:
         self._load_config()
         self._templates.clear()
         self._hwnd = None
+        self._resized_once = False
 
     def _ensure_window(self) -> int:
         if self._hwnd is None:
             self._hwnd = find_window(self._title_substring, self._process_name)
             if self._hwnd is None:
                 raise RuntimeError("Target window not found.")
+        if self._auto_resize and not self._resized_once:
+            self._apply_startup_resize(self._hwnd)
         return self._hwnd
+
+    def _apply_startup_resize(self, hwnd: int) -> None:
+        if self._resized_once:
+            return
+        if is_window_minimized(hwnd):
+            logging.info("Window is minimized; skipping auto-resize.")
+            return
+        try:
+            _origin_x, _origin_y, client_w, client_h = get_client_origin_and_size(hwnd)
+        except Exception as exc:
+            logging.warning("Failed to read window metrics for resize: %s", exc)
+            return
+        ref_w, ref_h = self._ref_size
+        if ref_w <= 0 or ref_h <= 0:
+            return
+        if client_w == ref_w and client_h == ref_h:
+            self._resized_once = True
+            return
+        if set_window_client_size(hwnd, ref_w, ref_h):
+            logging.info("Auto-resized window client to %dx%d", ref_w, ref_h)
+            self._resized_once = True
+        else:
+            logging.warning("Auto-resize failed to set client size %dx%d", ref_w, ref_h)
 
     def focus_window(self) -> bool:
         hwnd = self._ensure_window()
@@ -172,7 +269,8 @@ class AutomationEngine:
         if roi_ref is None:
             roi_ref = (0, 0, ref_w, ref_h)
         roi_screen = map_rect(roi_ref, self._ref_size, (render_rect[0], render_rect[1]), (render_rect[2], render_rect[3]))
-        image = self._capture.grab(roi_screen)
+        hwnd = self._ensure_window()
+        image = self._capture.grab_auto(roi_screen, hwnd, self._capture_method)
         return roi_screen, image
 
     def _resolve_threshold(self, threshold: Optional[float], use_default_threshold: bool) -> float:
@@ -192,13 +290,19 @@ class AutomationEngine:
         threshold: Optional[float] = None,
         use_default_threshold: bool = True,
         min_score_delta: Optional[float] = None,
+        debug_context: Optional[dict[str, object]] = None,
     ) -> Optional[MatchResult]:
         _, _, render_rect, scale_x, scale_y = self._get_window_metrics()
         roi_screen, image = self._capture_roi(roi_ref, render_rect)
         if image is None:
             return None
         detector = self._get_template(image_path)
-        score, loc, size, _second_best = detector.match_with_location(image, scale_x, scale_y)
+        method = "feature" if isinstance(detector, FeatureDetector) else "template"
+        score, loc, size, _second_best = detector.match_with_location(
+            image, scale_x, scale_y,
+            multi_scale_range=self._multi_scale_range,
+            multi_scale_steps=self._multi_scale_steps,
+        )
         if loc is None or size is None or not math.isfinite(score):
             return None
         min_score = self._resolve_threshold(threshold, use_default_threshold)
@@ -218,11 +322,50 @@ class AutomationEngine:
             )
             return None
         top_left = (roi_screen[0] + loc[0], roi_screen[1] + loc[1])
-        
+        image_filename = os.path.basename(image_path)
+
+        if self._debug_always_capture:
+            try:
+                import cv2
+
+                debug_img = image.copy()
+                debug_dir = self._debug_output_dir
+                if not os.path.isabs(debug_dir):
+                    debug_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), debug_dir)
+                os.makedirs(debug_dir, exist_ok=True)
+                draw_match_rect(debug_img, loc, size, (255, 0, 0), thickness=2)
+                debug_path = self._debug_path(debug_dir, "match", image_filename)
+                cv2.imwrite(debug_path, debug_img)
+                self._write_debug_meta(
+                    debug_path,
+                    {
+                        "type": "match",
+                        "template": image_filename,
+                        "score": float(score),
+                        "second": float(_second_best) if _second_best is not None else None,
+                        "delta": float(delta) if delta is not None else None,
+                        "method": method,
+                        "roi_ref": _to_list(roi_ref),
+                        "roi_screen": _to_list(roi_screen),
+                        "match_loc": _to_list(loc),
+                        "match_size": _to_list(size),
+                        "context": debug_context,
+                        "timestamp": time.time(),
+                    },
+                )
+                logging.info("Debug screenshot saved: %s", debug_path)
+            except Exception as exc:
+                logging.debug("Failed to save debug screenshot: %s", exc)
+
         # Pixel verification check (if enabled)
         if self._use_pixel_verification:
-            image_filename = os.path.basename(image_path)
-            verification_passed = verify_match(image, loc, image_filename)
+            verification_passed = verify_match(
+                image, loc, image_filename,
+                roi_screen=roi_screen,
+                ref_size=self._ref_size,
+                render_origin=(render_rect[0], render_rect[1]),
+                render_size=(render_rect[2], render_rect[3]),
+            )
 
             if self._debug_screenshot:
                 try:
@@ -234,25 +377,43 @@ class AutomationEngine:
                         debug_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), debug_dir)
                     os.makedirs(debug_dir, exist_ok=True)
 
-                    if verification_passed:
-                        for (rel_x, rel_y) in get_last_verified_points():
-                            abs_x = loc[0] + rel_x
-                            abs_y = loc[1] + rel_y
-                            cv2.circle(debug_img, (abs_x, abs_y), 5, (0, 255, 0), -1)
-                        cv2.rectangle(debug_img, loc, (loc[0] + size[0], loc[1] + size[1]), (0, 255, 0), 2)
-                        debug_path = os.path.join(debug_dir, f"verify_pass_{image_filename}")
-                        cv2.imwrite(debug_path, debug_img)
-                        logging.info("Debug screenshot saved: %s", debug_path)
+                    results = get_last_verification_results()
+                    if results:
+                        draw_verification_results(debug_img, results)
                     else:
                         failed_offset = get_last_failed_offset()
                         if failed_offset is not None:
                             abs_x = loc[0] + failed_offset[0]
                             abs_y = loc[1] + failed_offset[1]
                             cv2.circle(debug_img, (abs_x, abs_y), 5, (0, 0, 255), -1)
-                        cv2.rectangle(debug_img, loc, (loc[0] + size[0], loc[1] + size[1]), (0, 0, 255), 2)
-                        debug_path = os.path.join(debug_dir, f"verify_fail_{image_filename}")
-                        cv2.imwrite(debug_path, debug_img)
-                        logging.info("Debug screenshot saved: %s", debug_path)
+
+                    rect_color = (0, 255, 0) if verification_passed else (0, 0, 255)
+                    draw_match_rect(debug_img, loc, size, rect_color, thickness=2)
+                    debug_suffix = "verify_pass" if verification_passed else "verify_fail"
+                    debug_path = self._debug_path(debug_dir, debug_suffix, image_filename)
+                    cv2.imwrite(debug_path, debug_img)
+                    self._write_debug_meta(
+                        debug_path,
+                        {
+                            "type": debug_suffix,
+                            "template": image_filename,
+                            "score": float(score),
+                            "second": float(_second_best) if _second_best is not None else None,
+                            "delta": float(delta) if delta is not None else None,
+                            "method": method,
+                            "roi_ref": _to_list(roi_ref),
+                            "roi_screen": _to_list(roi_screen),
+                            "match_loc": _to_list(loc),
+                            "match_size": _to_list(size),
+                            "verification": {
+                                "passed": bool(verification_passed),
+                                "results": _serialize_results(results),
+                            },
+                            "context": debug_context,
+                            "timestamp": time.time(),
+                        },
+                    )
+                    logging.info("Debug screenshot saved: %s", debug_path)
                 except Exception as exc:
                     logging.debug("Failed to save debug screenshot: %s", exc)
             
@@ -263,7 +424,6 @@ class AutomationEngine:
         center = (top_left[0] + size[0] // 2, top_left[1] + size[1] // 2)
         ref_x = int(round((center[0] - render_rect[0]) / scale_x)) if scale_x else 0
         ref_y = int(round((center[1] - render_rect[1]) / scale_y)) if scale_y else 0
-        method = "feature" if isinstance(detector, FeatureDetector) else "template"
         match_count = None
         match_total = None
         if isinstance(detector, FeatureDetector):
@@ -282,12 +442,82 @@ class AutomationEngine:
             match_total=match_total,
         )
 
+    def verify_pixels(
+        self,
+        points: Any,
+        roi_ref: Optional[Tuple[int, int, int, int]] = None,
+        debug_context: Optional[dict[str, object]] = None,
+    ) -> Tuple[bool, float]:
+        """
+        Verify pixel colors at reference-space coordinates.
+
+        Args:
+            points: Iterable of pixel points. Each point can be:
+                - PixelPoint
+                - dict with x/y/rgb/tolerance
+                - tuple (x, y, (r, g, b), tolerance)
+            roi_ref: Optional ROI in reference coords to limit capture.
+        Returns:
+            (matched, score) where score is matched/total.
+        """
+        _, _, render_rect, _scale_x, _scale_y = self._get_window_metrics()
+        roi_screen, image = self._capture_roi(roi_ref, render_rect)
+        if image is None:
+            return False, 0.0
+        parsed_points = parse_pixel_points(points)
+        if not parsed_points:
+            return False, 0.0
+        render_origin = (render_rect[0], render_rect[1])
+        render_size = (render_rect[2], render_rect[3])
+        ok, score, results = pixel_points_check_with_results(
+            parsed_points,
+            image,
+            roi_screen,
+            self._ref_size,
+            render_origin,
+            render_size,
+            self._capture,
+        )
+        if self._debug_always_capture or self._debug_screenshot:
+            try:
+                import cv2
+
+                debug_img = image.copy()
+                draw_verification_results(debug_img, results)
+                debug_dir = self._debug_output_dir
+                if not os.path.isabs(debug_dir):
+                    debug_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), debug_dir)
+                os.makedirs(debug_dir, exist_ok=True)
+                suffix = "pass" if ok else "fail"
+                debug_path = os.path.join(debug_dir, f"verify_pixels_{suffix}_{int(time.time() * 1000)}.png")
+                cv2.imwrite(debug_path, debug_img)
+                self._write_debug_meta(
+                    debug_path,
+                    {
+                        "type": f"verify_pixels_{suffix}",
+                        "score": float(score),
+                        "roi_ref": _to_list(roi_ref),
+                        "roi_screen": _to_list(roi_screen),
+                        "verification": {
+                            "passed": bool(ok),
+                            "results": _serialize_results(results),
+                        },
+                        "context": debug_context,
+                        "timestamp": time.time(),
+                    },
+                )
+                logging.info("Debug verify_pixels screenshot saved: %s", debug_path)
+            except Exception as exc:
+                logging.debug("Failed to save verify_pixels debug screenshot: %s", exc)
+        return ok, score
+
     def image_present(
         self,
         image_path: str,
         roi_ref: Optional[Tuple[int, int, int, int]] = None,
         threshold: Optional[float] = None,
         use_default_threshold: bool = True,
+        debug_context: Optional[dict[str, object]] = None,
     ) -> bool:
         return (
             self.locate_image(
@@ -295,6 +525,7 @@ class AutomationEngine:
                 roi_ref=roi_ref,
                 threshold=threshold,
                 use_default_threshold=use_default_threshold,
+                debug_context=debug_context,
             )
             is not None
         )
@@ -307,6 +538,7 @@ class AutomationEngine:
         use_default_threshold: bool = True,
         timeout_s: float = 5.0,
         stop_check: Optional[Callable[[], bool]] = None,
+        debug_context: Optional[dict[str, object]] = None,
     ) -> Optional[MatchResult]:
         deadline = time.monotonic() + max(0.0, timeout_s)
         while True:
@@ -318,6 +550,7 @@ class AutomationEngine:
                     roi_ref=roi_ref,
                     threshold=threshold,
                     use_default_threshold=use_default_threshold,
+                    debug_context=debug_context,
                 )
             except RuntimeError as exc:
                 logging.warning("Window not ready: %s", exc)
@@ -343,6 +576,7 @@ class AutomationEngine:
         use_default_threshold: bool = True,
         offset_in_ref: bool = True,
         stop_check: Optional[Callable[[], bool]] = None,
+        debug_context: Optional[dict[str, object]] = None,
     ) -> bool:
         result = self.action_with_match(
             image_path,
@@ -354,6 +588,7 @@ class AutomationEngine:
             use_default_threshold=use_default_threshold,
             offset_in_ref=offset_in_ref,
             stop_check=stop_check,
+            debug_context=debug_context,
         )
         return result is not None
 
@@ -368,6 +603,7 @@ class AutomationEngine:
         use_default_threshold: bool = True,
         offset_in_ref: bool = True,
         stop_check: Optional[Callable[[], bool]] = None,
+        debug_context: Optional[dict[str, object]] = None,
     ) -> Optional[MatchResult]:
         result = self.wait_for_image(
             image_path,
@@ -376,6 +612,7 @@ class AutomationEngine:
             use_default_threshold=use_default_threshold,
             timeout_s=timeout_s,
             stop_check=stop_check,
+            debug_context=debug_context,
         )
         if result is None:
             return None
@@ -389,6 +626,58 @@ class AutomationEngine:
             else:
                 click_x += int(dx)
                 click_y += int(dy)
+        if self._debug_always_capture or self._debug_screenshot:
+            try:
+                import cv2
+
+                _, _, render_rect, _scale_x, _scale_y = self._get_window_metrics()
+                roi_screen, image = self._capture_roi(roi_ref, render_rect)
+                if image is not None:
+                    debug_img = image.copy()
+                    rel_click_x = int(click_x - roi_screen[0])
+                    rel_click_y = int(click_y - roi_screen[1])
+                    if 0 <= rel_click_x < debug_img.shape[1] and 0 <= rel_click_y < debug_img.shape[0]:
+                        cv2.circle(debug_img, (rel_click_x, rel_click_y), 6, (0, 255, 255), -1)
+                    rel_left = int(result.top_left[0] - roi_screen[0])
+                    rel_top = int(result.top_left[1] - roi_screen[1])
+                    t_w, t_h = result.template_size
+                    cv2.rectangle(
+                        debug_img,
+                        (rel_left, rel_top),
+                        (rel_left + t_w, rel_top + t_h),
+                        (255, 0, 0),
+                        2,
+                    )
+                    results = get_last_verification_results()
+                    if results:
+                        draw_verification_results(debug_img, results)
+                    debug_dir = self._debug_output_dir
+                    if not os.path.isabs(debug_dir):
+                        debug_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), debug_dir)
+                    os.makedirs(debug_dir, exist_ok=True)
+                    image_filename = os.path.basename(image_path)
+                    debug_path = self._debug_path(debug_dir, "click", image_filename)
+                    cv2.imwrite(debug_path, debug_img)
+                    self._write_debug_meta(
+                        debug_path,
+                        {
+                            "type": "click",
+                            "template": image_filename,
+                            "click_pos": _to_list((click_x, click_y)),
+                            "match_loc": _to_list((rel_left, rel_top)),
+                            "match_size": _to_list((t_w, t_h)),
+                            "roi_ref": _to_list(roi_ref),
+                            "roi_screen": _to_list(roi_screen),
+                            "verification": {
+                                "results": _serialize_results(results) if results else [],
+                            },
+                            "context": debug_context,
+                            "timestamp": time.time(),
+                        },
+                    )
+                    logging.info("Debug click screenshot saved: %s", debug_path)
+            except Exception as exc:
+                logging.debug("Failed to save debug click screenshot: %s", exc)
         self._move_mouse(click_x, click_y)
         self._click_at(click_x, click_y, click_duration)
         return result

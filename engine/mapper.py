@@ -4,6 +4,7 @@ import ctypes
 import logging
 import os
 from typing import Optional, Tuple
+from ctypes import wintypes
 
 try:
     import win32api
@@ -45,10 +46,21 @@ except Exception as exc:
     _user32.GetWindowTextLengthW.restype = ctypes.c_int
     _user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     _user32.GetWindowTextW.restype = ctypes.c_int
+    _user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    _user32.GetWindowRect.restype = wintypes.BOOL
     _user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
     _user32.GetClientRect.restype = wintypes.BOOL
     _user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
     _user32.ClientToScreen.restype = wintypes.BOOL
+    _user32.MoveWindow.argtypes = [
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.BOOL,
+    ]
+    _user32.MoveWindow.restype = wintypes.BOOL
     _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 
@@ -214,6 +226,43 @@ def focus_window(hwnd: int) -> bool:
         return bool(_user32.SetForegroundWindow(hwnd))
     except Exception as exc:
         logging.warning("Failed to focus window: %s", exc)
+        return False
+
+
+def set_window_client_size(hwnd: int, client_w: int, client_h: int) -> bool:
+    try:
+        if client_w <= 0 or client_h <= 0:
+            return False
+        if _PYWIN32_AVAILABLE:
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            win_w = right - left
+            win_h = bottom - top
+            c_left, c_top, c_right, c_bottom = win32gui.GetClientRect(hwnd)
+            cur_client_w = c_right - c_left
+            cur_client_h = c_bottom - c_top
+            extra_w = win_w - cur_client_w
+            extra_h = win_h - cur_client_h
+            target_w = max(1, int(client_w) + extra_w)
+            target_h = max(1, int(client_h) + extra_h)
+            return bool(win32gui.MoveWindow(hwnd, left, top, target_w, target_h, True))
+        _warn_pywin32_missing()
+        rect = wintypes.RECT()
+        if not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return False
+        client_rect = wintypes.RECT()
+        if not _user32.GetClientRect(hwnd, ctypes.byref(client_rect)):
+            return False
+        win_w = rect.right - rect.left
+        win_h = rect.bottom - rect.top
+        cur_client_w = client_rect.right - client_rect.left
+        cur_client_h = client_rect.bottom - client_rect.top
+        extra_w = win_w - cur_client_w
+        extra_h = win_h - cur_client_h
+        target_w = max(1, int(client_w) + extra_w)
+        target_h = max(1, int(client_h) + extra_h)
+        return bool(_user32.MoveWindow(hwnd, rect.left, rect.top, target_w, target_h, True))
+    except Exception as exc:
+        logging.warning("Failed to resize window: %s", exc)
         return False
 
 
