@@ -28,6 +28,7 @@ from .mapper import (
     map_rect,
     focus_window,
     set_process_dpi_awareness,
+    set_window_topmost,
     set_window_client_size,
 )
 from .debug_draw import draw_match_rect, draw_verification_results
@@ -102,6 +103,7 @@ class AutomationEngine:
         self._capture_method = "screen"
         self._auto_resize = False
         self._resized_once = False
+        self._force_topmost = False
         self._load_config()
 
     def _write_debug_meta(self, debug_path: str, meta: dict[str, object]) -> None:
@@ -125,6 +127,7 @@ class AutomationEngine:
         self._render_cfg = self._config.get("render_area", {"mode": "stretch"})
         window_cfg = self._config.get("window", {})
         self._auto_resize = bool(window_cfg.get("auto_resize", False))
+        self._force_topmost = bool(window_cfg.get("force_topmost", False))
         marker_cfg = self._config.get("marker_detection", {})
         self._default_threshold = float(marker_cfg.get("threshold", 0.85))
         self._default_min_score_delta = float(marker_cfg.get("min_score_delta", 0.0))
@@ -149,7 +152,7 @@ class AutomationEngine:
         self._debug_keep_history = bool(debug_cfg.get("keep_history", False))
         capture_cfg = self._config.get("capture", {})
         capture_method = str(capture_cfg.get("method", "auto")).lower()
-        if capture_method not in {"auto", "screen", "window"}:
+        if capture_method not in {"auto", "screen", "window", "window_raise"}:
             capture_method = "auto"
         self._capture_method = capture_method
         poll_ms = self._config.get("poll_interval_ms", 50)
@@ -174,6 +177,8 @@ class AutomationEngine:
             self._hwnd = find_window(self._title_substring, self._process_name)
             if self._hwnd is None:
                 raise RuntimeError("Target window not found.")
+            if self._force_topmost:
+                set_window_topmost(self._hwnd, True)
         if self._auto_resize and not self._resized_once:
             self._apply_startup_resize(self._hwnd)
         return self._hwnd
@@ -510,6 +515,22 @@ class AutomationEngine:
             except Exception as exc:
                 logging.debug("Failed to save verify_pixels debug screenshot: %s", exc)
         return ok, score
+
+    def capture_roi(
+        self,
+        roi_ref: Optional[Tuple[int, int, int, int]] = None,
+    ) -> Optional[Any]:
+        """Capture a region of the screen and return the raw BGR numpy array.
+
+        Args:
+            roi_ref: Region in reference coordinates (x, y, w, h).
+                     If None, captures the full reference area.
+        Returns:
+            BGR numpy array, or None on capture failure.
+        """
+        _, _, render_rect, _scale_x, _scale_y = self._get_window_metrics()
+        _roi_screen, image = self._capture_roi(roi_ref, render_rect)
+        return image
 
     def image_present(
         self,

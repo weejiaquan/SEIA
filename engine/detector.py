@@ -515,30 +515,55 @@ def pixel_points_check_with_results(
 
 
 class RoiDeltaDetector:
-    def __init__(self, delta_threshold: float, smoothing: int = 0) -> None:
+    """Detect changes in an ROI by comparing BGR frames.
+
+    ``delta_threshold`` is the fraction of pixels (0.0–1.0) that must exceed
+    ``pixel_threshold`` (per-channel max diff) to be considered "changed".
+    An optional 2-D ``mask`` (uint8, >0 = active) restricts comparison to
+    specific pixels.
+
+    .. note::
+        Prior versions used grayscale mean-diff for scoring.  The semantics
+        changed to *changed-pixel ratio* in BGR space.  Old config values
+        such as ``12.0`` should be replaced with values like ``0.01`` (1%).
+    """
+
+    def __init__(
+        self,
+        delta_threshold: float,
+        smoothing: int = 0,
+        pixel_threshold: int = 20,
+        mask: Optional[np.ndarray] = None,
+    ) -> None:
         self.delta_threshold = float(delta_threshold)
         self.smoothing = int(smoothing) if smoothing else 0
-        self._baseline: Optional[np.ndarray] = None
+        self.pixel_threshold = int(pixel_threshold)
+        self._mask = mask  # 2-D uint8, >0 = active pixel
+        self._baseline: Optional[np.ndarray] = None  # BGR float32
 
     def reset(self) -> None:
         self._baseline = None
 
     def update(self, roi_bgr: np.ndarray) -> Tuple[float, bool]:
-        try:
-            gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-        except Exception:
-            return 0.0, False
-        gray_f = gray.astype(np.float32)
+        bgr_f = roi_bgr.astype(np.float32)
         if self._baseline is None:
-            self._baseline = gray_f
+            self._baseline = bgr_f
             return 0.0, False
-        diff = cv2.absdiff(gray_f, self._baseline)
-        score = float(np.mean(diff))
+        diff = cv2.absdiff(bgr_f, self._baseline)
+        # Max channel diff per pixel → single 2-D array
+        max_diff = np.max(diff, axis=2)
+        if self._mask is not None:
+            max_diff = max_diff[self._mask > 0]
+        total = max_diff.size
+        if total == 0:
+            return 0.0, False
+        changed = int(np.count_nonzero(max_diff > self.pixel_threshold))
+        score = changed / total
         detected = score >= self.delta_threshold
         if self.smoothing and self.smoothing > 1:
             alpha = 1.0 / float(self.smoothing)
-            self._baseline = (1.0 - alpha) * self._baseline + alpha * gray_f
+            self._baseline = (1.0 - alpha) * self._baseline + alpha * bgr_f
         else:
             if not detected:
-                self._baseline = gray_f
+                self._baseline = bgr_f
         return score, detected

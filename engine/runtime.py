@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import atexit
 import ctypes
 import inspect
 import json
+import logging
 import os
 import sys
 import threading
 import time
-from typing import Callable, Iterable, Tuple
+from typing import Callable, Iterable, Optional, Tuple
 
+import cv2
 import keyboard
+import numpy as np
 import pydirectinput
 
 from .core import AutomationEngine
+from .mapper import set_window_topmost
 from .verify import add_pixel_verification
 
 
@@ -60,6 +65,7 @@ _global_hotkey_lock = threading.Lock()
 _global_hotkeys: dict[str, tuple[set[str], int]] = {}
 _global_hotkey_state: dict[str, bool] = {}
 _global_hotkey_callbacks: dict[str, Callable[[], None]] = {}
+_cleanup_done = False
 
 DEFAULT_TIMEOUT_S = 1000.0
 DEFAULT_STEP_DELAY_S = 1.0
@@ -147,6 +153,49 @@ def _debug_log_enabled_now() -> bool:
 def _log_action(message: str) -> None:
     if _debug_log_enabled_now():
         print(f"[runtime] {message}", flush=True)
+
+
+def _log_standby_context() -> None:
+    if not _debug_log_enabled_now():
+        return
+    path = _get_config_path()
+    _log_action(f"standby config_path={path}")
+    config: dict[str, object] | None = None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except Exception as exc:
+        _log_action(f"standby config_load_failed={exc}")
+    if isinstance(config, dict):
+        target = config.get("target", {}) if isinstance(config.get("target", {}), dict) else {}
+        render_cfg = config.get("render_area", {}) if isinstance(config.get("render_area", {}), dict) else {}
+        window_cfg = config.get("window", {}) if isinstance(config.get("window", {}), dict) else {}
+        capture_cfg = config.get("capture", {}) if isinstance(config.get("capture", {}), dict) else {}
+        ref = config.get("reference_resolution", {}) if isinstance(config.get("reference_resolution", {}), dict) else {}
+        _log_action(
+            "standby config "
+            f"target_title={target.get('window_title_substring', '')} "
+            f"target_process={target.get('process_name', '')} "
+            f"ref={int(ref.get('w', 0))}x{int(ref.get('h', 0))} "
+            f"render_mode={render_cfg.get('mode', '')} "
+            f"render_offset={render_cfg.get('offset', {})} "
+            f"render_size={render_cfg.get('size', {})} "
+            f"auto_resize={window_cfg.get('auto_resize', False)} "
+            f"force_topmost={window_cfg.get('force_topmost', False)} "
+            f"capture_method={capture_cfg.get('method', '')}"
+        )
+    try:
+        engine = _ensure_engine()
+        (origin_x, origin_y), (client_w, client_h), render_rect, scale_x, scale_y = engine._get_window_metrics()
+        _log_action(
+            "standby window "
+            f"origin={origin_x},{origin_y} "
+            f"client={client_w}x{client_h} "
+            f"render_rect={render_rect[0]},{render_rect[1]},{render_rect[2]},{render_rect[3]} "
+            f"scale={scale_x:.3f}/{scale_y:.3f}"
+        )
+    except Exception as exc:
+        _log_action(f"standby window_metrics_failed={exc}")
 
 
 def _caller_context(action: str) -> dict[str, object]:
@@ -395,10 +444,33 @@ def reset_stop() -> None:
 
 
 def cleanup() -> None:
+    global _cleanup_done
+    if _cleanup_done:
+        return
+    _cleanup_done = True
+    _clear_force_topmost()
     keyboard.unhook_all_hotkeys()
     _global_hotkey_stop.set()
     if _global_hotkey_thread is not None and _global_hotkey_thread.is_alive():
         _global_hotkey_thread.join(timeout=0.5)
+
+
+def _clear_force_topmost() -> None:
+    engine = _engine
+    if engine is None:
+        return
+    if not getattr(engine, "_force_topmost", False):
+        return
+    hwnd = getattr(engine, "_hwnd", None)
+    if not hwnd:
+        return
+    try:
+        set_window_topmost(hwnd, False)
+    except Exception as exc:
+        logging.debug("Failed to clear topmost on exit: %s", exc)
+
+
+atexit.register(cleanup)
 
 
 def sleep(seconds: float) -> None:
@@ -417,6 +489,7 @@ def wait_for_restart() -> None:
     if _restart_event.is_set():
         _restart_event.clear()
         return
+    _log_standby_context()
     _log_action("standby waiting for restart")
     while True:
         if _restart_event.wait(0.1):
@@ -798,6 +871,320 @@ def wait_for_absent_optional(
             return False
 
 
+def _load_mask(mask_image: str, roi_size: Tuple[int, int]) -> Optional[np.ndarray]:
+    """Load a PNG, extract its alpha channel, and resize to *roi_size*.
+
+    Returns a 2-D uint8 array (>0 = active pixel) or ``None`` if the image
+    has no alpha channel or cannot be read.
+    """
+    path = _resolve_path(mask_image)
+    raw = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if raw is None or raw.size == 0:
+        logging.warning("_load_mask: could not read %s", path)
+        return None
+    if raw.ndim != 3 or raw.shape[2] != 4:
+        logging.warning("_load_mask: %s has no alpha channel; mask ignored", path)
+        return None
+    alpha = raw[:, :, 3]
+    mask = (alpha > 0).astype(np.uint8) * 255
+    h, w = roi_size  # (height, width)
+    if mask.shape[0] != h or mask.shape[1] != w:
+        mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    return mask
+
+
+def _frames_differ(
+    prev_bgr: np.ndarray,
+    curr_bgr: np.ndarray,
+    pixel_threshold: int,
+    change_ratio: float,
+    mask: Optional[np.ndarray] = None,
+) -> bool:
+    """Return True if enough pixels differ between two BGR frames."""
+    diff = cv2.absdiff(prev_bgr, curr_bgr)
+    max_diff = np.max(diff, axis=2)
+    if mask is not None:
+        max_diff = max_diff[mask > 0]
+    total = max_diff.size
+    if total == 0:
+        return False
+    changed = int(np.count_nonzero(max_diff > pixel_threshold))
+    return (changed / total) >= change_ratio
+
+
+def _capture_roi_bgr(roi_ref: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+    """Capture an ROI in reference coords and return the BGR array."""
+    try:
+        engine = _ensure_engine()
+        return engine.capture_roi(roi_ref)
+    except Exception as exc:
+        logging.debug("_capture_roi_bgr failed: %s", exc)
+        return None
+
+
+def wait_for_stable(
+    roi_ref: Tuple[int, int, int, int],
+    timeout_s: float = 30.0,
+    poll_interval_s: float = 0.2,
+    stable_count: int = 3,
+    pixel_threshold: int = 20,
+    change_ratio: float = 0.01,
+    wait_for_change: bool = False,
+    mask_image: str | None = None,
+    require: bool = True,
+) -> bool:
+    """Wait until an ROI stops changing between consecutive captures.
+
+    Args:
+        roi_ref: Region in reference coordinates (x, y, w, h).
+        timeout_s: Maximum time to wait.
+        poll_interval_s: Interval between captures.
+        stable_count: Consecutive identical frames required.
+        pixel_threshold: Per-channel diff threshold per pixel.
+        change_ratio: Fraction of pixels that must change to count as different.
+        wait_for_change: If True, first wait for the ROI to *change* from its
+            initial state before waiting for stability.
+        mask_image: Optional path to a PNG with alpha channel used as a mask.
+        require: If True, raise SystemExit on timeout.
+
+    Returns:
+        True if the ROI stabilised within the timeout, False otherwise.
+    """
+    _log_action(
+        f"wait_for_stable roi={roi_ref} timeout={timeout_s:.1f}s "
+        f"stable_count={stable_count} wait_for_change={wait_for_change}"
+    )
+    if stop_requested():
+        raise SystemExit(0)
+
+    deadline = time.monotonic() + max(0.0, timeout_s)
+
+    # Load mask (once) if provided
+    mask: Optional[np.ndarray] = None
+    if mask_image is not None:
+        first_frame = _capture_roi_bgr(roi_ref)
+        if first_frame is not None:
+            mask = _load_mask(mask_image, (first_frame.shape[0], first_frame.shape[1]))
+
+    # Phase 1: optionally wait for initial change
+    if wait_for_change:
+        baseline = _capture_roi_bgr(roi_ref)
+        if baseline is None:
+            baseline = None  # will retry
+        while time.monotonic() < deadline:
+            if stop_requested():
+                raise SystemExit(0)
+            sleep(poll_interval_s)
+            current = _capture_roi_bgr(roi_ref)
+            if current is None:
+                baseline = None
+                continue
+            if baseline is None:
+                baseline = current
+                continue
+            if baseline.shape != current.shape:
+                baseline = current
+                continue
+            if _frames_differ(baseline, current, pixel_threshold, change_ratio, mask):
+                _log_action("wait_for_stable: initial change detected")
+                break
+        else:
+            _log_action("wait_for_stable: timeout waiting for initial change")
+            if require:
+                _fail("Timeout waiting for ROI change in wait_for_stable")
+            print(_colored("[runtime] ✗ wait_for_stable timed out (no change)", Color.RED + Color.BOLD), flush=True)
+            return False
+
+    # Phase 2: wait for stability
+    prev = _capture_roi_bgr(roi_ref)
+    consecutive_stable = 0
+
+    while time.monotonic() < deadline:
+        if stop_requested():
+            raise SystemExit(0)
+        sleep(poll_interval_s)
+        current = _capture_roi_bgr(roi_ref)
+        if current is None:
+            consecutive_stable = 0
+            prev = None
+            continue
+        if prev is None or prev.shape != current.shape:
+            prev = current
+            consecutive_stable = 0
+            continue
+        if _frames_differ(prev, current, pixel_threshold, change_ratio, mask):
+            consecutive_stable = 0
+        else:
+            consecutive_stable += 1
+        prev = current
+        if consecutive_stable >= stable_count:
+            _log_action(f"wait_for_stable: stable after {stable_count} frames")
+            print(_colored("[runtime] ✓ wait_for_stable ok=1", Color.GREEN + Color.BOLD), flush=True)
+            return True
+
+    _log_action("wait_for_stable: timeout")
+    if require:
+        _fail("Timeout waiting for stability in wait_for_stable")
+    print(_colored("[runtime] ✗ wait_for_stable ok=0", Color.RED + Color.BOLD), flush=True)
+    return False
+
+
+def press_until_stable(
+    keys: Iterable[str] | str,
+    roi_ref: Tuple[int, int, int, int],
+    timeout_s: float = 60.0,
+    step_delay_s: float = 0.5,
+    stable_count: int = 3,
+    pixel_threshold: int = 20,
+    change_ratio: float = 0.01,
+    poll_interval_s: float = 0.2,
+    attempt_timeout_s: float = 5.0,
+    mask_image: str | None = None,
+    press_while_waiting: bool = False,
+    require: bool = True,
+) -> bool:
+    """Press *keys* repeatedly until an ROI stabilises.
+
+    Each iteration presses every key in *keys*, then polls the ROI for
+    ``attempt_timeout_s`` checking for stability.  If the ROI does not
+    stabilise, keys are pressed again.
+
+    If ``press_while_waiting`` is True, keys are spammed continuously in a
+    background loop while stability is checked. In that mode, the
+    ``attempt_timeout_s`` window is ignored and stability is checked across
+    the full ``timeout_s`` duration.
+
+    Args:
+        keys: Key name(s) to press each attempt.
+        roi_ref: Region in reference coordinates (x, y, w, h).
+        timeout_s: Overall timeout.
+        step_delay_s: Delay after each key press.
+        stable_count: Consecutive identical frames required.
+        pixel_threshold: Per-channel diff threshold per pixel.
+        change_ratio: Fraction of changed pixels to count as different.
+        poll_interval_s: Interval between captures within an attempt.
+        attempt_timeout_s: Max time to wait per attempt before retrying keys.
+        mask_image: Optional path to a PNG with alpha channel used as mask.
+        press_while_waiting: If True, keep pressing keys while checking stability.
+        require: If True, raise SystemExit on overall timeout.
+
+    Returns:
+        True if the ROI stabilised, False on timeout.
+    """
+    if isinstance(keys, str):
+        key_list = [keys]
+    else:
+        key_list = list(keys)
+
+    _log_action(
+        f"press_until_stable keys={','.join(key_list)} roi={roi_ref} "
+        f"timeout={timeout_s:.1f}s attempt_timeout={attempt_timeout_s:.1f}s "
+        f"press_while_waiting={int(press_while_waiting)}"
+    )
+    if stop_requested():
+        raise SystemExit(0)
+
+    overall_deadline = time.monotonic() + max(0.0, timeout_s)
+
+    # Load mask once
+    mask: Optional[np.ndarray] = None
+    if mask_image is not None:
+        first_frame = _capture_roi_bgr(roi_ref)
+        if first_frame is not None:
+            mask = _load_mask(mask_image, (first_frame.shape[0], first_frame.shape[1]))
+
+    if press_while_waiting:
+        stop_spam = threading.Event()
+
+        def _spam_keys() -> None:
+            try:
+                while not stop_spam.is_set():
+                    for key in key_list:
+                        if stop_spam.is_set():
+                            break
+                        press(key)
+                        sleep(step_delay_s)
+            except SystemExit:
+                stop_spam.set()
+
+        spam_thread = threading.Thread(target=_spam_keys, name="press-until-stable-spam", daemon=True)
+        spam_thread.start()
+        try:
+            prev = _capture_roi_bgr(roi_ref)
+            consecutive_stable = 0
+            while time.monotonic() < overall_deadline:
+                if stop_requested():
+                    raise SystemExit(0)
+                sleep(poll_interval_s)
+                current = _capture_roi_bgr(roi_ref)
+                if current is None:
+                    consecutive_stable = 0
+                    prev = None
+                    continue
+                if prev is None or prev.shape != current.shape:
+                    prev = current
+                    consecutive_stable = 0
+                    continue
+                if _frames_differ(prev, current, pixel_threshold, change_ratio, mask):
+                    consecutive_stable = 0
+                else:
+                    consecutive_stable += 1
+                prev = current
+                if consecutive_stable >= stable_count:
+                    _log_action(f"press_until_stable: stable after {stable_count} frames")
+                    print(_colored("[runtime] ✓ press_until_stable ok=1", Color.GREEN + Color.BOLD), flush=True)
+                    return True
+        finally:
+            stop_spam.set()
+            if spam_thread.is_alive():
+                spam_thread.join(timeout=0.5)
+    else:
+        while time.monotonic() < overall_deadline:
+            if stop_requested():
+                raise SystemExit(0)
+
+            # Press keys
+            for key in key_list:
+                press(key)
+                sleep(step_delay_s)
+
+            # Observe for stability
+            attempt_end = min(time.monotonic() + attempt_timeout_s, overall_deadline)
+            prev = _capture_roi_bgr(roi_ref)
+            consecutive_stable = 0
+
+            while time.monotonic() < attempt_end:
+                if stop_requested():
+                    raise SystemExit(0)
+                sleep(poll_interval_s)
+                current = _capture_roi_bgr(roi_ref)
+                if current is None:
+                    consecutive_stable = 0
+                    prev = None
+                    continue
+                if prev is None or prev.shape != current.shape:
+                    prev = current
+                    consecutive_stable = 0
+                    continue
+                if _frames_differ(prev, current, pixel_threshold, change_ratio, mask):
+                    consecutive_stable = 0
+                else:
+                    consecutive_stable += 1
+                prev = current
+                if consecutive_stable >= stable_count:
+                    _log_action(f"press_until_stable: stable after {stable_count} frames")
+                    print(_colored("[runtime] ✓ press_until_stable ok=1", Color.GREEN + Color.BOLD), flush=True)
+                    return True
+
+            _log_action("press_until_stable: not stable, retrying keys")
+
+    _log_action("press_until_stable: overall timeout")
+    if require:
+        _fail("Timeout in press_until_stable")
+    print(_colored("[runtime] ✗ press_until_stable ok=0", Color.RED + Color.BOLD), flush=True)
+    return False
+
+
 def press_until(
     image_name: str,
     keys: Iterable[str],
@@ -860,6 +1247,144 @@ def press_until(
                 _fail(f"Timeout waiting for: {image_name}")
             print(_colored(f"[runtime] ✗ press_until result image={image_name} ok=0", Color.RED + Color.BOLD), flush=True)
             return False
+
+
+def press_until_or_skip_on_stable(
+    image_name: str,
+    keys: Iterable[str],
+    timeout_s: float = DEFAULT_LOOP_TIMEOUT_S,
+    step_delay_s: float = DEFAULT_STEP_DELAY_S,
+    poll_interval_s: float = 0.2,
+    stable_count: int = 6,
+    pixel_threshold: int = 20,
+    change_ratio: float = 0.01,
+    wait_for_change: bool = False,
+    use_default_threshold: bool = True,
+    require: bool = False,
+    near: Tuple[int, int] | None = None,
+    radius: int | None = None,
+    roi_ref: Tuple[int, int, int, int] | None = None,
+    stable_roi_ref: Tuple[int, int, int, int] | None = None,
+    verify_pixels: list[tuple] | None = None,
+    mask_image: str | None = None,
+) -> bool:
+    """Press keys repeatedly while checking for a target image or a stable ROI.
+
+    Returns True if the image is found. Returns False if the ROI is stable
+    (interpreted as "stuck") or the timeout is reached.
+    """
+    if stop_requested():
+        raise SystemExit(0)
+
+    key_list = list(keys)
+
+    if verify_pixels:
+        add_pixel_verification(image_name, verify_pixels)
+
+    roi_ref = roi_ref if roi_ref is not None else _near_to_roi(near, radius)
+    stable_roi = stable_roi_ref if stable_roi_ref is not None else roi_ref
+    if stable_roi is None:
+        stable_roi = (0, 0, REF_W, REF_H)
+
+    _log_action(
+        "press_until_or_skip_on_stable "
+        f"image={image_name} "
+        f"keys={','.join(key_list)} "
+        f"timeout={float(timeout_s):.2f}s "
+        f"step_delay={float(step_delay_s):.2f}s "
+        f"poll_interval={float(poll_interval_s):.2f}s "
+        f"stable_count={int(stable_count)} "
+        f"wait_for_change={int(wait_for_change)}"
+    )
+
+    stop_spam = threading.Event()
+
+    def _spam_keys() -> None:
+        try:
+            while not stop_spam.is_set():
+                for key in key_list:
+                    if stop_spam.is_set():
+                        break
+                    press(key)
+                    sleep(step_delay_s)
+        except SystemExit:
+            stop_spam.set()
+
+    spam_thread = threading.Thread(target=_spam_keys, name="press-until-skip-spam", daemon=True)
+    spam_thread.start()
+
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    debug_context = _caller_context("press_until_or_skip_on_stable")
+
+    mask: Optional[np.ndarray] = None
+    if mask_image is not None:
+        first_frame = _capture_roi_bgr(stable_roi)
+        if first_frame is not None:
+            mask = _load_mask(mask_image, (first_frame.shape[0], first_frame.shape[1]))
+
+    prev = _capture_roi_bgr(stable_roi)
+    consecutive_stable = 0
+    seen_change = False
+
+    try:
+        while time.monotonic() < deadline:
+            if stop_requested():
+                raise SystemExit(0)
+            match = _locate_match(
+                image_name,
+                use_default_threshold=use_default_threshold,
+                near=near,
+                radius=radius,
+                roi_ref=roi_ref,
+                min_score_delta=None,
+                debug_context=debug_context,
+            )
+            if match is not None:
+                score_text, delta_text, ref_text, screen_text, extra_text = _format_match(match)
+                _log_action(
+                    "press_until_or_skip_on_stable match "
+                    f"image={image_name} "
+                    f"score={score_text} "
+                    f"delta={delta_text} "
+                    f"ref={ref_text} "
+                    f"screen={screen_text} "
+                    f"{extra_text}"
+                )
+                print(_colored(f"[runtime] ✓ press_until_or_skip_on_stable result image={image_name} ok=1", Color.GREEN + Color.BOLD), flush=True)
+                return True
+
+            sleep(poll_interval_s)
+            current = _capture_roi_bgr(stable_roi)
+            if current is None:
+                consecutive_stable = 0
+                prev = None
+                continue
+            if prev is None or prev.shape != current.shape:
+                prev = current
+                consecutive_stable = 0
+                continue
+            if _frames_differ(prev, current, pixel_threshold, change_ratio, mask):
+                consecutive_stable = 0
+                seen_change = True
+            else:
+                if not wait_for_change or seen_change:
+                    consecutive_stable += 1
+            prev = current
+            if consecutive_stable >= stable_count:
+                _log_action("press_until_or_skip_on_stable: stable, skipping")
+                print(_colored(f"[runtime] ⚠ press_until_or_skip_on_stable result image={image_name} ok=0 stable=1", Color.YELLOW + Color.BOLD), flush=True)
+                return False
+    finally:
+        stop_spam.set()
+        if spam_thread.is_alive():
+            spam_thread.join(timeout=0.5)
+
+    _log_action("press_until_or_skip_on_stable: timeout")
+    if require:
+        print(_colored(f"[runtime] ✗ press_until_or_skip_on_stable result image={image_name} ok=0", Color.RED + Color.BOLD), flush=True)
+        _fail(f"Timeout waiting for: {image_name}")
+    print(_colored(f"[runtime] ✗ press_until_or_skip_on_stable result image={image_name} ok=0", Color.RED + Color.BOLD), flush=True)
+    return False
 
 
 def press_until_optional(

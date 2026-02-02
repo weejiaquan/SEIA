@@ -155,9 +155,9 @@ def _get_process_name_ctypes(hwnd: int) -> Optional[str]:
 
 
 def find_window(title_substring: str, process_name: Optional[str] = None) -> Optional[int]:
-    if not title_substring:
+    if not title_substring and not process_name:
         return None
-    title_substring = title_substring.lower()
+    title_substring = title_substring.lower() if title_substring else ""
     process_name_l = process_name.lower() if process_name else None
     matches: list[int] = []
     if _PYWIN32_AVAILABLE:
@@ -165,10 +165,11 @@ def find_window(title_substring: str, process_name: Optional[str] = None) -> Opt
             if not win32gui.IsWindowVisible(hwnd):
                 return True
             title = win32gui.GetWindowText(hwnd)
-            if not title:
-                return True
-            if title_substring not in title.lower():
-                return True
+            if title_substring:
+                if not title:
+                    return True
+                if title_substring not in title.lower():
+                    return True
             if process_name_l:
                 name = _get_process_name(hwnd)
                 if not _process_name_matches(name, process_name_l):
@@ -187,13 +188,16 @@ def find_window(title_substring: str, process_name: Optional[str] = None) -> Opt
         if not _user32.IsWindowVisible(hwnd):
             return True
         length = _user32.GetWindowTextLengthW(hwnd)
-        if length == 0:
-            return True
-        buf = ctypes.create_unicode_buffer(length + 1)
-        _user32.GetWindowTextW(hwnd, buf, length + 1)
-        title = buf.value
-        if title_substring not in title.lower():
-            return True
+        title = ""
+        if length > 0:
+            buf = ctypes.create_unicode_buffer(length + 1)
+            _user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value
+        if title_substring:
+            if not title:
+                return True
+            if title_substring not in title.lower():
+                return True
         if process_name_l:
             name = _get_process_name_ctypes(hwnd)
             if not _process_name_matches(name, process_name_l):
@@ -226,6 +230,21 @@ def focus_window(hwnd: int) -> bool:
         return bool(_user32.SetForegroundWindow(hwnd))
     except Exception as exc:
         logging.warning("Failed to focus window: %s", exc)
+        return False
+
+
+def set_window_topmost(hwnd: int, enabled: bool = True) -> bool:
+    try:
+        if _PYWIN32_AVAILABLE:
+            insert_after = win32con.HWND_TOPMOST if enabled else win32con.HWND_NOTOPMOST
+            flags = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW
+            return bool(win32gui.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags))
+        _warn_pywin32_missing()
+        insert_after = -1 if enabled else -2  # HWND_TOPMOST / HWND_NOTOPMOST
+        flags = 0x0002 | 0x0001 | 0x0010 | 0x0040  # SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW
+        return bool(_user32.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags))
+    except Exception as exc:
+        logging.warning("Failed to set topmost=%s: %s", enabled, exc)
         return False
 
 

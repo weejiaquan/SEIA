@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import time
 from ctypes import wintypes
 from typing import Optional, Tuple
 
@@ -13,6 +14,15 @@ import numpy as np
 _BI_RGB = 0
 _DIB_RGB_COLORS = 0
 _PW_RENDERFULLCONTENT = 0x00000002
+_GWL_EXSTYLE = -20
+_WS_EX_TOPMOST = 0x00000008
+_HWND_TOPMOST = -1
+_HWND_NOTOPMOST = -2
+_SWP_NOMOVE = 0x0002
+_SWP_NOSIZE = 0x0001
+_SWP_NOACTIVATE = 0x0010
+_SWP_SHOWWINDOW = 0x0040
+_BLACK_WARNING_INTERVAL_S = 5.0
 
 
 class _BITMAPINFOHEADER(ctypes.Structure):
@@ -42,6 +52,14 @@ class ScreenCapture:
     def __init__(self) -> None:
         self._sct = mss.mss()
         self._last_capture_source: Optional[str] = None
+        self._last_black_warning = 0.0
+
+    def _warn_black(self, message: str) -> None:
+        now = time.monotonic()
+        if now - self._last_black_warning < _BLACK_WARNING_INTERVAL_S:
+            return
+        self._last_black_warning = now
+        logging.warning(message)
 
     def grab(self, rect: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
         return self.grab_screen(rect)
@@ -156,10 +174,22 @@ class ScreenCapture:
 
     def grab_auto(self, rect: Tuple[int, int, int, int], hwnd: Optional[int], method: str) -> Optional[np.ndarray]:
         method = (method or "screen").lower()
+        if method == "window_raise":
+            img = self.grab_window(hwnd or 0, rect)
+            if img is not None and not _looks_black(img):
+                _log_capture_source(self, "window", method)
+                return img
+            if img is not None:
+                self._warn_black("Window capture looks black; falling back to raised screen capture.")
+            else:
+                logging.debug("Window capture unavailable; falling back to raised screen capture.")
+            screen_img = _grab_screen_with_raise(self, rect, hwnd)
+            _log_capture_source(self, "screen", method)
+            return screen_img
         if method == "window":
             img = self.grab_window(hwnd or 0, rect)
             if img is not None and _looks_black(img):
-                logging.warning("Window capture looks black; consider auto/screen capture.")
+                self._warn_black("Window capture looks black; consider auto/screen capture.")
             _log_capture_source(self, "window", method)
             return img
         if method == "auto":
@@ -196,3 +226,60 @@ def _log_capture_source(capture: "ScreenCapture", source: str, method: str) -> N
         return
     capture._last_capture_source = source
     logging.info("Capture source: %s (method=%s)", source, method)
+
+
+def _grab_screen_with_raise(
+    capture: ScreenCapture,
+    rect: Tuple[int, int, int, int],
+    hwnd: Optional[int],
+) -> Optional[np.ndarray]:
+    if not hwnd:
+        return capture.grab_screen(rect)
+    user32 = ctypes.windll.user32
+    prev_hwnd = int(user32.GetForegroundWindow())
+    prev_topmost = False
+    was_topmost = True
+    try:
+        if prev_hwnd:
+            prev_topmost = bool(user32.GetWindowLongW(prev_hwnd, _GWL_EXSTYLE) & _WS_EX_TOPMOST)
+        was_topmost = bool(user32.GetWindowLongW(int(hwnd), _GWL_EXSTYLE) & _WS_EX_TOPMOST)
+        user32.ShowWindow(int(hwnd), 9)  # SW_RESTORE
+        user32.SetWindowPos(
+            int(hwnd),
+            _HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE | _SWP_SHOWWINDOW,
+        )
+        user32.BringWindowToTop(int(hwnd))
+        user32.SetForegroundWindow(int(hwnd))
+        time.sleep(0.05)
+        return capture.grab_screen(rect)
+    finally:
+        if not hwnd:
+            return
+        if not was_topmost:
+            user32.SetWindowPos(
+                int(hwnd),
+                _HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE | _SWP_SHOWWINDOW,
+            )
+        if prev_hwnd and prev_hwnd != int(hwnd) and user32.IsWindow(prev_hwnd):
+            if prev_topmost:
+                user32.SetWindowPos(
+                    prev_hwnd,
+                    _HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE | _SWP_SHOWWINDOW,
+                )
+            user32.BringWindowToTop(prev_hwnd)
+            user32.SetForegroundWindow(prev_hwnd)

@@ -24,11 +24,9 @@
   },
   "marker_detection": {
     "method": "template",
-    "threshold": 0.8,
-    "min_score_delta": 0.02,
-    "use_pixel_verification": true,
-    "multi_scale_range": 0.03,
-    "multi_scale_steps": 3
+    "threshold": 0.5,
+    "min_score_delta": 0.0,
+    "use_pixel_verification": true
   },
   "input": {
     "mouse_motion": "instant",
@@ -44,12 +42,7 @@
   },
   "capture": {
     "method": "window_raise"
-  },
-  "runtime": {
-    "global_key_poll": true
-  },
-  "test_input": {
-    "enabled": true,
-    "global_key_poll": true
   }
 }
+
+

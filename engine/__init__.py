@@ -9,6 +9,7 @@ from .mapper import (
     map_point,
     map_rect,
     set_process_dpi_awareness,
+    set_window_topmost,
 )
 
 __all__ = [
@@ -27,4 +28,5 @@ __all__ = [
     "map_point",
     "map_rect",
     "set_process_dpi_awareness",
+    "set_window_topmost",
 ]
