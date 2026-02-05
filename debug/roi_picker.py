@@ -1,95 +1,38 @@
 from __future__ import annotations
 
-import json
 import os
-import sys
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import cv2
 
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-
+from common import DEFAULT_CONFIG_PATH, get_capture_method, get_render_context, load_config
 from engine.capture import ScreenCapture
-from engine.mapper import find_window, get_client_origin_and_size, set_process_dpi_awareness
+from engine.mapper import set_process_dpi_awareness
 
 
-ROOT_DIR = PARENT_DIR
-CONFIG_PATH = os.path.join(ROOT_DIR, "config.json")
-
-
-def load_config(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def get_ref_size(config: Dict[str, Any]) -> Tuple[int, int]:
-    ref = config.get("reference_resolution", {})
-    return int(ref.get("w", 1920)), int(ref.get("h", 1080))
-
-
-def compute_render_rect(
-    client_origin: Tuple[int, int],
-    client_size: Tuple[int, int],
-    ref_size: Tuple[int, int],
-    render_cfg: Dict[str, Any],
-) -> Tuple[int, int, int, int]:
-    mode = str(render_cfg.get("mode", "stretch")).lower()
-    client_w, client_h = client_size
-    ref_w, ref_h = ref_size
-    if mode == "manual":
-        offset = render_cfg.get("offset", {})
-        size = render_cfg.get("size", {})
-        width = int(size.get("w", 0)) or client_w
-        height = int(size.get("h", 0)) or client_h
-        off_x = int(offset.get("x", 0))
-        off_y = int(offset.get("y", 0))
-        return client_origin[0] + off_x, client_origin[1] + off_y, width, height
-    if mode == "fit":
-        if ref_w <= 0 or ref_h <= 0 or client_w <= 0 or client_h <= 0:
-            return client_origin[0], client_origin[1], client_w, client_h
-        scale = min(client_w / ref_w, client_h / ref_h)
-        render_w = int(round(ref_w * scale))
-        render_h = int(round(ref_h * scale))
-        off_x = int(round((client_w - render_w) / 2))
-        off_y = int(round((client_h - render_h) / 2))
-        return client_origin[0] + off_x, client_origin[1] + off_y, render_w, render_h
-    return client_origin[0], client_origin[1], client_w, client_h
+DEFAULT_TOLERANCE = 30
 
 
 def main() -> None:
     set_process_dpi_awareness()
-    if not os.path.exists(CONFIG_PATH):
-        raise FileNotFoundError(f"Missing config: {CONFIG_PATH}")
-    config = load_config(CONFIG_PATH)
-    target = config.get("target", {})
-    title_substring = target.get("window_title_substring", "")
-    process_name = target.get("process_name", "") or None
-    hwnd = find_window(title_substring, process_name)
-    if hwnd is None:
-        raise RuntimeError("Target window not found.")
-
-    ref_size = get_ref_size(config)
-    render_cfg = config.get("render_area", {})
-
-    origin_x, origin_y, client_w, client_h = get_client_origin_and_size(hwnd)
-    render_x, render_y, render_w, render_h = compute_render_rect(
-        (origin_x, origin_y), (client_w, client_h), ref_size, render_cfg
-    )
+    if not os.path.exists(DEFAULT_CONFIG_PATH):
+        raise FileNotFoundError(f"Missing config: {DEFAULT_CONFIG_PATH}")
+    config = load_config(DEFAULT_CONFIG_PATH)
+    capture_method = get_capture_method(config)
+    hwnd, ref_size, render_rect, scale_x, scale_y = get_render_context(config)
+    render_x, render_y, render_w, render_h = render_rect
 
     capture = ScreenCapture()
-    img = capture.grab((render_x, render_y, render_w, render_h))
+    img = capture.grab_auto((render_x, render_y, render_w, render_h), hwnd, capture_method)
     if img is None:
         raise RuntimeError("Capture failed.")
 
-    scale_x = render_w / ref_size[0] if ref_size[0] else 1.0
-    scale_y = render_h / ref_size[1] if ref_size[1] else 1.0
-
-    window_name = "ROI Picker (drag to select, press q to quit)"
-    selecting = {"start": None, "end": None, "rect": None}
+    window_name = "ROI Picker (drag to select, press A to mark pixel, q to quit)"
+    selecting = {"start": None, "end": None, "rect": None, "cursor": None}
+    marked_pixels: list[dict[str, Any]] = []
 
     def on_mouse(event, x, y, _flags, _param) -> None:
+        selecting["cursor"] = (x, y)
         if event == cv2.EVENT_LBUTTONDOWN:
             selecting["start"] = (x, y)
             selecting["end"] = (x, y)
@@ -127,11 +70,41 @@ def main() -> None:
         elif selecting["rect"] is not None:
             left, top, width, height = selecting["rect"]
             cv2.rectangle(frame, (left, top), (left + width, top + height), (0, 255, 0), 2)
+        for pixel in marked_pixels:
+            px, py = pixel["local"]
+            cv2.circle(frame, (px, py), 3, (0, 255, 255), -1)
         cv2.imshow(window_name, frame)
-        if cv2.waitKey(20) & 0xFF == ord("q"):
+        key = cv2.waitKey(20) & 0xFF
+        if key == ord("q"):
             break
+        if key in (ord("a"), ord("A")):
+            cursor = selecting.get("cursor")
+            if cursor is None:
+                continue
+            x, y = cursor
+            if y < 0 or x < 0 or y >= img.shape[0] or x >= img.shape[1]:
+                continue
+            b, g, r = img[y, x]
+            rgb = (int(r), int(g), int(b))
+            ref_x = int(round(x / scale_x)) if scale_x else 0
+            ref_y = int(round(y / scale_y)) if scale_y else 0
+            marked_pixels.append(
+                {"ref": (ref_x, ref_y), "rgb": rgb, "tol": DEFAULT_TOLERANCE, "local": (x, y)}
+            )
+            print(
+                f"PIXEL ref: {{\"x\": {ref_x}, \"y\": {ref_y}, \"rgb\": [{rgb[0]}, {rgb[1]}, {rgb[2]}], "
+                f"\"tolerance\": {DEFAULT_TOLERANCE}}}"
+            )
 
     cv2.destroyAllWindows()
+    if marked_pixels:
+        print("\nverify_pixels=[")
+        for pixel in marked_pixels:
+            rx, ry = pixel["ref"]
+            rgb = pixel["rgb"]
+            tol = pixel["tol"]
+            print(f"    ({rx}, {ry}, ({rgb[0]}, {rgb[1]}, {rgb[2]}), {tol}),")
+        print("]")
 
 
 if __name__ == "__main__":

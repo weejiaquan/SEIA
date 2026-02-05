@@ -16,19 +16,9 @@ PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
+from common import get_cursor_pos
 from engine.core import AutomationEngine
 from engine.mapper import is_window_minimized
-
-
-def _get_cursor_pos() -> Tuple[int, int]:
-    try:
-        import win32api
-        return win32api.GetCursorPos()
-    except ImportError:
-        import ctypes
-        point = ctypes.wintypes.POINT()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
-        return point.x, point.y
 
 
 def pick_drag(
@@ -68,7 +58,7 @@ def pick_drag(
             return
         if len(points) >= 2:
             points.clear()
-        x, y = _get_cursor_pos()
+        x, y = get_cursor_pos()
         ref_x, ref_y = _screen_to_ref(x, y)
         points.append((x, y, ref_x, ref_y))
 

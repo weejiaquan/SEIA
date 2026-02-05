@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import keyboard
+import numpy as np
 import pydirectinput
 
 PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -21,7 +22,16 @@ if PARENT_DIR not in sys.path:
 
 from engine.capture import ScreenCapture
 from engine.detector import FeatureDetector, RoiDeltaDetector, TemplateDetector, parse_pixel_points, pixel_points_check
-from engine.mapper import find_window, get_client_origin_and_size, is_window_minimized, map_point, map_rect, set_process_dpi_awareness
+from engine.mapper import (
+    find_window,
+    get_client_origin_and_size,
+    is_window_minimized,
+    map_point,
+    map_rect,
+    set_process_dpi_awareness,
+    set_window_client_size,
+    set_window_topmost,
+)
 
 
 ROOT_DIR = PARENT_DIR
@@ -63,8 +73,10 @@ def _sample_config() -> Dict[str, Any]:
         },
         "screen_change_detection": {
             "method": "roi_delta",
-            "delta_threshold": 12.0,
+            "delta_threshold": 0.01,
             "smoothing": 8,
+            "pixel_threshold": 20,
+            "mask_image": None,
         },
         "debug": {
             "save_frames": False,
@@ -87,6 +99,8 @@ def _sample_config() -> Dict[str, Any]:
                 "set_marker_near": "ctrl+f1",
                 "click_marker": "ctrl+f9",
                 "click_mouse": "ctrl+f11",
+                "auto_click": "z",
+                "auto_esc": "x",
                 "log_mouse": "ctrl+f5",
                 "track_mouse": "ctrl+shift+f5",
                 "set_marker_offset": "ctrl+f3"
@@ -94,6 +108,9 @@ def _sample_config() -> Dict[str, Any]:
             "click_point": {"x": 960, "y": 540},
             "scroll_amount": 500,
             "scroll_events": 1,
+            "auto_click_interval_s": 3.0,
+            "auto_esc_interval_s": 3.0,
+            "global_key_poll": False,
             "drag_start": {"x": 960, "y": 540},
             "drag_end": {"x": 960, "y": 740},
             "drag_hold_s": 0.0,
@@ -135,6 +152,44 @@ def ensure_templates_dir(path: str) -> None:
 def _get_ref_size(config: Dict[str, Any]) -> Tuple[int, int]:
     ref = config.get("reference_resolution", {})
     return int(ref.get("w", 1920)), int(ref.get("h", 1080))
+
+
+def _get_capture_method(config: Dict[str, Any]) -> str:
+    capture_cfg = config.get("capture", {})
+    method = str(capture_cfg.get("method", "auto")).lower()
+    if method not in {"auto", "screen", "window", "window_raise"}:
+        return "auto"
+    return method
+
+
+def _get_force_topmost(config: Dict[str, Any]) -> bool:
+    window_cfg = config.get("window", {})
+    return bool(window_cfg.get("force_topmost", False))
+
+
+def _get_auto_resize(config: Dict[str, Any]) -> bool:
+    window_cfg = config.get("window", {})
+    return bool(window_cfg.get("auto_resize", False))
+
+
+def _apply_startup_resize(hwnd: int, ref_size: Tuple[int, int]) -> None:
+    if is_window_minimized(hwnd):
+        logging.info("Window is minimized; skipping auto-resize.")
+        return
+    try:
+        _origin_x, _origin_y, client_w, client_h = get_client_origin_and_size(hwnd)
+    except Exception as exc:
+        logging.warning("Failed to read window metrics for resize: %s", exc)
+        return
+    ref_w, ref_h = ref_size
+    if ref_w <= 0 or ref_h <= 0:
+        return
+    if client_w == ref_w and client_h == ref_h:
+        return
+    if set_window_client_size(hwnd, ref_w, ref_h):
+        logging.info("Auto-resized window client to %dx%d", ref_w, ref_h)
+    else:
+        logging.warning("Auto-resize failed to set client size %dx%d", ref_w, ref_h)
 
 
 def _get_roi(config: Dict[str, Any], key: str) -> Tuple[int, int, int, int]:
@@ -213,6 +268,72 @@ def _scroll_wheel(delta: int) -> None:
     ctypes.windll.user32.mouse_event(0x0800, 0, 0, int(delta), 0)
 
 
+def _vk_from_key_name(key: str) -> Optional[int]:
+    cleaned = key.strip().lower()
+    if not cleaned or "+" in cleaned:
+        return None
+    if len(cleaned) == 1 and cleaned.isalnum():
+        return ord(cleaned.upper())
+    if cleaned.startswith("f") and cleaned[1:].isdigit():
+        number = int(cleaned[1:])
+        if 1 <= number <= 24:
+            return 0x70 + (number - 1)
+    aliases = {
+        "esc": 0x1B,
+        "escape": 0x1B,
+        "space": 0x20,
+        "tab": 0x09,
+        "enter": 0x0D,
+    }
+    return aliases.get(cleaned)
+
+
+def _key_is_down(vk: int) -> bool:
+    return bool(ctypes.windll.user32.GetAsyncKeyState(int(vk)) & 0x8000)
+
+
+def _parse_hotkey(hotkey: str) -> Optional[Tuple[set[str], int]]:
+    cleaned = hotkey.strip().lower().replace(" ", "")
+    if not cleaned:
+        return None
+    parts = [part for part in cleaned.split("+") if part]
+    if not parts:
+        return None
+    modifiers: set[str] = set()
+    key_name: Optional[str] = None
+    for part in parts:
+        if part in {"ctrl", "control"}:
+            modifiers.add("ctrl")
+        elif part == "shift":
+            modifiers.add("shift")
+        elif part == "alt":
+            modifiers.add("alt")
+        elif part in {"win", "windows", "cmd", "command"}:
+            modifiers.add("win")
+        else:
+            if key_name is not None:
+                return None
+            key_name = part
+    if key_name is None:
+        return None
+    vk = _vk_from_key_name(key_name)
+    if vk is None:
+        return None
+    return modifiers, vk
+
+
+def _modifiers_down(modifiers: set[str]) -> bool:
+    if "ctrl" in modifiers and not _key_is_down(0x11):
+        return False
+    if "shift" in modifiers and not _key_is_down(0x10):
+        return False
+    if "alt" in modifiers and not _key_is_down(0x12):
+        return False
+    if "win" in modifiers and not (_key_is_down(0x5B) or _key_is_down(0x5C)):
+        return False
+    return True
+
+
 def _parse_offset_text(text: str) -> Optional[Tuple[int, int]]:
     cleaned = text.strip().replace("(", "").replace(")", "")
     if not cleaned:
@@ -259,6 +380,8 @@ def _near_to_roi(
 
 def _save_debug_frame(
     capture: ScreenCapture,
+    hwnd: int,
+    capture_method: str,
     output_dir: str,
     frame_index: int,
     client_origin: Tuple[int, int],
@@ -274,7 +397,7 @@ def _save_debug_frame(
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
     full_rect = (client_origin[0], client_origin[1], client_size[0], client_size[1])
-    frame = capture.grab(full_rect)
+    frame = capture.grab_auto(full_rect, hwnd, capture_method)
     if frame is None:
         return
     if overlay:
@@ -331,6 +454,9 @@ def main() -> None:
     config = load_or_create_config(CONFIG_PATH)
     ensure_templates_dir(os.path.join(ROOT_DIR, "templates"))
 
+    capture_method = _get_capture_method(config)
+    force_topmost = _get_force_topmost(config)
+    auto_resize = _get_auto_resize(config)
     poll_interval_ms = int(config.get("poll_interval_ms", 50))
     target = config.get("target", {})
     title_substring = target.get("window_title_substring", "")
@@ -340,8 +466,11 @@ def main() -> None:
     if hwnd is None:
         logging.error("Target window not found for title substring: %s", title_substring)
         return
-
     ref_size = _get_ref_size(config)
+    if force_topmost:
+        set_window_topmost(hwnd, True)
+    if auto_resize:
+        _apply_startup_resize(hwnd, ref_size)
     marker_roi_ref = _get_roi(config, "marker_roi")
     change_roi_ref = _get_roi(config, "change_roi")
     render_cfg = config.get("render_area", {})
@@ -360,9 +489,20 @@ def main() -> None:
 
     change_cfg = config.get("screen_change_detection", {})
     change_method = change_cfg.get("method", "roi_delta")
-    change_delta_threshold = float(change_cfg.get("delta_threshold", 10.0))
+    change_delta_threshold = float(change_cfg.get("delta_threshold", 0.01))
     change_smoothing = int(change_cfg.get("smoothing", 0) or 0)
-    delta_detector = RoiDeltaDetector(change_delta_threshold, change_smoothing)
+    change_pixel_threshold = int(change_cfg.get("pixel_threshold", 20))
+    change_mask_image = change_cfg.get("mask_image") or None
+    change_mask: np.ndarray | None = None
+    if change_mask_image:
+        mask_path = _resolve_path(change_mask_image)
+        raw_mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        if raw_mask is not None and raw_mask.ndim == 3 and raw_mask.shape[2] == 4:
+            change_mask = (raw_mask[:, :, 3] > 0).astype(np.uint8) * 255
+            logging.info("Loaded change detection mask: %s", mask_path)
+        else:
+            logging.warning("Change detection mask_image has no alpha or unreadable: %s", mask_path)
+    delta_detector = RoiDeltaDetector(change_delta_threshold, change_smoothing, change_pixel_threshold, change_mask)
     if change_method != "roi_delta":
         logging.error("Unknown screen_change_detection method: %s", change_method)
 
@@ -387,12 +527,17 @@ def main() -> None:
     test_set_marker_near_hotkey = test_hotkeys.get("set_marker_near", "ctrl+f1")
     test_click_marker_hotkey = test_hotkeys.get("click_marker", "ctrl+f9")
     test_click_mouse_hotkey = test_hotkeys.get("click_mouse", "ctrl+f11")
+    test_auto_click_hotkey = test_hotkeys.get("auto_click", "z")
+    test_auto_esc_hotkey = test_hotkeys.get("auto_esc", "x")
+    global_key_poll = bool(test_input_cfg.get("global_key_poll", False))
     test_log_mouse_hotkey = test_hotkeys.get("log_mouse", "ctrl+f5")
     test_track_mouse_hotkey = test_hotkeys.get("track_mouse", DEFAULT_TRACK_MOUSE_HOTKEY)
     test_set_marker_offset_hotkey = test_hotkeys.get("set_marker_offset", "ctrl+f3")
     test_click_point = test_input_cfg.get("click_point", {"x": 0, "y": 0})
     scroll_amount = int(test_input_cfg.get("scroll_amount", 500))
     scroll_events = max(1, int(test_input_cfg.get("scroll_events", 1)))
+    auto_click_interval_s = max(0.1, float(test_input_cfg.get("auto_click_interval_s", 3.0)))
+    auto_esc_interval_s = max(0.1, float(test_input_cfg.get("auto_esc_interval_s", 3.0)))
     drag_start_cfg = test_input_cfg.get("drag_start", {"x": 0, "y": 0})
     drag_end_cfg = test_input_cfg.get("drag_end", {"x": 0, "y": 0})
     drag_start = (int(drag_start_cfg.get("x", 0)), int(drag_start_cfg.get("y", 0)))
@@ -409,6 +554,12 @@ def main() -> None:
         int(marker_near_cfg.get("y", 0)),
     )
     marker_radius = int(test_input_cfg.get("marker_radius", 0))
+    auto_click_enabled = False
+    auto_click_next = 0.0
+    auto_esc_enabled = False
+    auto_esc_next = 0.0
+    global_hotkeys: Dict[str, Tuple[set[str], int]] = {}
+    global_hotkey_state: Dict[str, bool] = {}
 
     state = {"monitoring": False, "running": True}
     mouse_state = {"track": False, "last_report": 0.0}
@@ -438,7 +589,7 @@ def main() -> None:
         
         # Sample pixel color at cursor position
         try:
-            pixel_img = capture.grab((x, y, 1, 1))
+            pixel_img = capture.grab_auto((x, y, 1, 1), hwnd, capture_method)
             if pixel_img is not None and pixel_img.size > 0:
                 b, g, r = pixel_img[0, 0]
                 rgb = (int(r), int(g), int(b))
@@ -495,17 +646,22 @@ def main() -> None:
         nonlocal poll_interval_ms
         nonlocal ref_size, marker_roi_ref, change_roi_ref, render_cfg
         nonlocal marker_method, marker_threshold, marker_min_score_delta, marker_bypass_threshold, template_path, pixel_points, marker_detector
-        nonlocal change_method, change_delta_threshold, change_smoothing, delta_detector
+        nonlocal change_method, change_delta_threshold, change_smoothing, change_pixel_threshold, change_mask_image, change_mask, delta_detector
         nonlocal debug_save_frames, debug_save_on_toggle_only, debug_save_every_n, debug_output_dir, debug_overlay
         nonlocal test_enabled, test_click_point, scroll_amount, scroll_events
+        nonlocal auto_click_interval_s, auto_click_enabled, auto_click_next
+        nonlocal auto_esc_interval_s, auto_esc_enabled, auto_esc_next
+        nonlocal global_key_poll, global_hotkeys, global_hotkey_state
         nonlocal drag_start, drag_end, drag_hold_s, drag_duration_s, drag_button, drag_use_ref
         nonlocal marker_click_offset, marker_near, marker_radius
+        nonlocal auto_resize
 
         poll_interval_ms = int(new_config.get("poll_interval_ms", poll_interval_ms))
         ref_size = _get_ref_size(new_config)
         marker_roi_ref = _get_roi(new_config, "marker_roi")
         change_roi_ref = _get_roi(new_config, "change_roi")
         render_cfg = new_config.get("render_area", render_cfg)
+        auto_resize = _get_auto_resize(new_config)
 
         marker_cfg = new_config.get("marker_detection", {})
         marker_method = marker_cfg.get("method", marker_method)
@@ -529,7 +685,19 @@ def main() -> None:
         change_method = change_cfg.get("method", change_method)
         change_delta_threshold = float(change_cfg.get("delta_threshold", change_delta_threshold))
         change_smoothing = int(change_cfg.get("smoothing", change_smoothing) or 0)
-        delta_detector = RoiDeltaDetector(change_delta_threshold, change_smoothing)
+        change_pixel_threshold = int(change_cfg.get("pixel_threshold", change_pixel_threshold))
+        new_mask_image = change_cfg.get("mask_image") or None
+        change_mask = None
+        if new_mask_image:
+            mask_path = _resolve_path(new_mask_image)
+            raw_mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+            if raw_mask is not None and raw_mask.ndim == 3 and raw_mask.shape[2] == 4:
+                change_mask = (raw_mask[:, :, 3] > 0).astype(np.uint8) * 255
+                logging.info("Loaded change detection mask: %s", mask_path)
+            else:
+                logging.warning("Change detection mask_image has no alpha or unreadable: %s", mask_path)
+        change_mask_image = new_mask_image
+        delta_detector = RoiDeltaDetector(change_delta_threshold, change_smoothing, change_pixel_threshold, change_mask)
         if change_method != "roi_delta":
             logging.error("Unknown screen_change_detection method: %s", change_method)
 
@@ -542,9 +710,17 @@ def main() -> None:
 
         test_input_cfg = new_config.get("test_input", {})
         test_enabled = bool(test_input_cfg.get("enabled", test_enabled))
+        new_global_key_poll = bool(test_input_cfg.get("global_key_poll", global_key_poll))
+        if new_global_key_poll != global_key_poll:
+            logging.info(
+                "global_key_poll change requires restart; keeping %s",
+                "ON" if global_key_poll else "OFF",
+            )
         test_click_point = test_input_cfg.get("click_point", test_click_point)
         scroll_amount = int(test_input_cfg.get("scroll_amount", scroll_amount))
         scroll_events = max(1, int(test_input_cfg.get("scroll_events", scroll_events)))
+        auto_click_interval_s = max(0.1, float(test_input_cfg.get("auto_click_interval_s", auto_click_interval_s)))
+        auto_esc_interval_s = max(0.1, float(test_input_cfg.get("auto_esc_interval_s", auto_esc_interval_s)))
         drag_start_cfg = test_input_cfg.get("drag_start", {"x": drag_start[0], "y": drag_start[1]})
         drag_end_cfg = test_input_cfg.get("drag_end", {"x": drag_end[0], "y": drag_end[1]})
         drag_start = (
@@ -572,6 +748,53 @@ def main() -> None:
             int(marker_near_cfg.get("y", near_y)),
         )
         marker_radius = int(test_input_cfg.get("marker_radius", marker_radius))
+        if not test_enabled and auto_click_enabled:
+            auto_click_enabled = False
+            auto_click_next = 0.0
+            logging.info("Auto-click OFF (test input disabled)")
+        if not test_enabled and auto_esc_enabled:
+            auto_esc_enabled = False
+            auto_esc_next = 0.0
+            logging.info("Auto-ESC OFF (test input disabled)")
+        _build_global_hotkeys()
+
+    def _build_global_hotkeys() -> None:
+        nonlocal global_hotkeys, global_hotkey_state
+        global_hotkeys = {}
+        if not global_key_poll:
+            global_hotkey_state = {}
+            return
+
+        def register(action: str, hotkey: str) -> None:
+            parsed = _parse_hotkey(hotkey)
+            if parsed is None:
+                logging.warning("Global key poll: unsupported hotkey '%s' for %s", hotkey, action)
+                return
+            global_hotkeys[action] = parsed
+
+        register("reload_config", RELOAD_HOTKEY)
+        register("toggle_monitoring_hotkey", MONITOR_HOTKEY)
+        register("exit", EXIT_HOTKEY)
+
+        if test_enabled:
+            register("click_point", test_click_hotkey)
+            register("press_esc", test_esc_hotkey)
+            register("scroll_up", test_scroll_up_hotkey)
+            register("scroll_down", test_scroll_hotkey)
+            register("set_scroll_amount", test_set_scroll_amount_hotkey)
+            register("drag", test_drag_hotkey)
+            register("set_drag_start", test_set_drag_start_hotkey)
+            register("set_drag_end", test_set_drag_end_hotkey)
+            register("set_marker_near", test_set_marker_near_hotkey)
+            register("click_marker", test_click_marker_hotkey)
+            register("click_mouse", test_click_mouse_hotkey)
+            register("toggle_auto_click", test_auto_click_hotkey)
+            register("toggle_auto_esc", test_auto_esc_hotkey)
+            register("log_mouse", test_log_mouse_hotkey)
+            register("toggle_track_mouse", test_track_mouse_hotkey)
+            register("set_marker_offset", test_set_marker_offset_hotkey)
+
+        global_hotkey_state = {name: False for name in global_hotkeys}
 
     def reload_config() -> None:
         try:
@@ -579,6 +802,8 @@ def main() -> None:
             apply_config(new_config)
             nonlocal_vars["last_marker_present"] = None
             nonlocal_vars["last_change_detected"] = None
+            if auto_resize:
+                _apply_startup_resize(hwnd, ref_size)
             logging.info("Reloaded config and template from %s", CONFIG_PATH)
         except Exception as exc:
             logging.error("Failed to reload config: %s", exc)
@@ -647,6 +872,14 @@ def main() -> None:
     def do_click_mouse() -> None:
         if test_enabled:
             enqueue_action("click_mouse")
+
+    def do_toggle_auto_click() -> None:
+        if test_enabled:
+            enqueue_action("toggle_auto_click")
+
+    def do_toggle_auto_esc() -> None:
+        if test_enabled:
+            enqueue_action("toggle_auto_esc")
 
     def do_log_mouse() -> None:
         if test_enabled:
@@ -722,6 +955,8 @@ def main() -> None:
         logging.info("  %s  set marker near", test_set_marker_near_hotkey)
         logging.info("  %s  click marker", test_click_marker_hotkey)
         logging.info("  %s  click mouse", test_click_mouse_hotkey)
+        logging.info("  %s  toggle auto-click (every %.2fs)", test_auto_click_hotkey, auto_click_interval_s)
+        logging.info("  %s  toggle auto-ESC (every %.2fs)", test_auto_esc_hotkey, auto_esc_interval_s)
         logging.info("  %s  log mouse", test_log_mouse_hotkey)
         logging.info("  %s  toggle mouse tracking", test_track_mouse_hotkey)
         logging.info("  %s  set marker offset", test_set_marker_offset_hotkey)
@@ -745,6 +980,7 @@ def main() -> None:
         )
         marker_near_label = "none" if marker_near is None else f"{marker_near[0]},{marker_near[1]}"
         logging.info("Marker near current: %s radius %d", marker_near_label, marker_radius)
+        logging.info("Global key poll %s (all hotkeys)", "ON" if global_key_poll else "OFF")
         logging.info("Monitoring currently %s", "ON" if state["monitoring"] else "OFF")
 
     nonlocal_vars = {
@@ -753,30 +989,63 @@ def main() -> None:
         "last_change_detected": None,
     }
 
-    keyboard.add_hotkey(RELOAD_HOTKEY, do_reload_config)
-    keyboard.add_hotkey(MONITOR_HOTKEY, do_toggle_monitoring)
-    keyboard.add_hotkey(EXIT_HOTKEY, stop)
+    _build_global_hotkeys()
+
+    if not global_key_poll or "reload_config" not in global_hotkeys:
+        keyboard.add_hotkey(RELOAD_HOTKEY, do_reload_config)
+    if not global_key_poll or "toggle_monitoring_hotkey" not in global_hotkeys:
+        keyboard.add_hotkey(MONITOR_HOTKEY, do_toggle_monitoring)
+    if not global_key_poll or "exit" not in global_hotkeys:
+        keyboard.add_hotkey(EXIT_HOTKEY, stop)
     if test_enabled:
-        keyboard.add_hotkey(test_click_hotkey, do_test_click)
-        keyboard.add_hotkey(test_esc_hotkey, do_test_esc)
-        keyboard.add_hotkey(test_scroll_up_hotkey, do_scroll_up)
-        keyboard.add_hotkey(test_scroll_hotkey, do_scroll_down)
-        keyboard.add_hotkey(test_set_scroll_amount_hotkey, do_set_scroll_amount)
-        keyboard.add_hotkey(test_drag_hotkey, do_drag)
-        keyboard.add_hotkey(test_set_drag_start_hotkey, do_set_drag_start)
-        keyboard.add_hotkey(test_set_drag_end_hotkey, do_set_drag_end)
-        keyboard.add_hotkey(test_set_marker_near_hotkey, do_set_marker_near)
-        keyboard.add_hotkey(test_click_marker_hotkey, do_click_marker)
-        keyboard.add_hotkey(test_click_mouse_hotkey, do_click_mouse)
-        keyboard.add_hotkey(test_log_mouse_hotkey, do_log_mouse)
-        keyboard.add_hotkey(test_track_mouse_hotkey, do_toggle_track_mouse)
-        keyboard.add_hotkey(test_set_marker_offset_hotkey, do_set_marker_offset)
+        if not global_key_poll or "click_point" not in global_hotkeys:
+            keyboard.add_hotkey(test_click_hotkey, do_test_click)
+        if not global_key_poll or "press_esc" not in global_hotkeys:
+            keyboard.add_hotkey(test_esc_hotkey, do_test_esc)
+        if not global_key_poll or "scroll_up" not in global_hotkeys:
+            keyboard.add_hotkey(test_scroll_up_hotkey, do_scroll_up)
+        if not global_key_poll or "scroll_down" not in global_hotkeys:
+            keyboard.add_hotkey(test_scroll_hotkey, do_scroll_down)
+        if not global_key_poll or "set_scroll_amount" not in global_hotkeys:
+            keyboard.add_hotkey(test_set_scroll_amount_hotkey, do_set_scroll_amount)
+        if not global_key_poll or "drag" not in global_hotkeys:
+            keyboard.add_hotkey(test_drag_hotkey, do_drag)
+        if not global_key_poll or "set_drag_start" not in global_hotkeys:
+            keyboard.add_hotkey(test_set_drag_start_hotkey, do_set_drag_start)
+        if not global_key_poll or "set_drag_end" not in global_hotkeys:
+            keyboard.add_hotkey(test_set_drag_end_hotkey, do_set_drag_end)
+        if not global_key_poll or "set_marker_near" not in global_hotkeys:
+            keyboard.add_hotkey(test_set_marker_near_hotkey, do_set_marker_near)
+        if not global_key_poll or "click_marker" not in global_hotkeys:
+            keyboard.add_hotkey(test_click_marker_hotkey, do_click_marker)
+        if not global_key_poll or "click_mouse" not in global_hotkeys:
+            keyboard.add_hotkey(test_click_mouse_hotkey, do_click_mouse)
+        if not global_key_poll or "toggle_auto_click" not in global_hotkeys:
+            keyboard.add_hotkey(test_auto_click_hotkey, do_toggle_auto_click)
+        if not global_key_poll or "toggle_auto_esc" not in global_hotkeys:
+            keyboard.add_hotkey(test_auto_esc_hotkey, do_toggle_auto_esc)
+        if not global_key_poll or "log_mouse" not in global_hotkeys:
+            keyboard.add_hotkey(test_log_mouse_hotkey, do_log_mouse)
+        if not global_key_poll or "toggle_track_mouse" not in global_hotkeys:
+            keyboard.add_hotkey(test_track_mouse_hotkey, do_toggle_track_mouse)
+        if not global_key_poll or "set_marker_offset" not in global_hotkeys:
+            keyboard.add_hotkey(test_set_marker_offset_hotkey, do_set_marker_offset)
 
     logging.info("Ready.")
     log_help()
 
     try:
         while state["running"]:
+            if global_key_poll and global_hotkeys:
+                for action, (modifiers, vk) in global_hotkeys.items():
+                    is_down = _modifiers_down(modifiers) and _key_is_down(vk)
+                    was_down = global_hotkey_state.get(action, False)
+                    if is_down and not was_down:
+                        if action == "exit":
+                            stop()
+                        else:
+                            enqueue_action(action)
+                    global_hotkey_state[action] = is_down
             handle_cli_keys()
             while not action_queue.empty():
                 action = action_queue.get()
@@ -800,6 +1069,22 @@ def main() -> None:
                     status = "ON" if mouse_state["track"] else "OFF"
                     mouse_state["last_report"] = 0.0
                     logging.info("Mouse tracking %s", status)
+                    continue
+                if action == "toggle_auto_click":
+                    auto_click_enabled = not auto_click_enabled
+                    auto_click_next = 0.0
+                    status = "ON" if auto_click_enabled else "OFF"
+                    if auto_click_enabled:
+                        auto_click_next = time.monotonic()
+                    logging.info("Auto-click %s (interval %.2fs)", status, auto_click_interval_s)
+                    continue
+                if action == "toggle_auto_esc":
+                    auto_esc_enabled = not auto_esc_enabled
+                    auto_esc_next = 0.0
+                    status = "ON" if auto_esc_enabled else "OFF"
+                    if auto_esc_enabled:
+                        auto_esc_next = time.monotonic()
+                    logging.info("Auto-ESC %s (interval %.2fs)", status, auto_esc_interval_s)
                     continue
                 if action == "show_help":
                     print("")
@@ -1051,7 +1336,7 @@ def main() -> None:
                     scale_y = render_h / ref_size[1] if ref_size[1] else 1.0
                     roi_ref = _near_to_roi(marker_near, marker_radius, ref_size) or marker_roi_ref
                     marker_rect = map_rect(roi_ref, ref_size, (render_x, render_y), (render_w, render_h))
-                    marker_img = capture.grab(marker_rect)
+                    marker_img = capture.grab_auto(marker_rect, hwnd, capture_method)
                     if marker_img is None:
                         logging.warning("Marker capture failed; no click performed.")
                         continue
@@ -1100,6 +1385,21 @@ def main() -> None:
                     log_mouse_position("Mouse")
                     mouse_state["last_report"] = now
 
+            if auto_click_enabled:
+                now = time.monotonic()
+                if now >= auto_click_next:
+                    x, y = _get_cursor_pos()
+                    logging.info("Auto-click at %d,%d", x, y)
+                    pydirectinput.click(x, y)
+                    auto_click_next = now + auto_click_interval_s
+
+            if auto_esc_enabled:
+                now = time.monotonic()
+                if now >= auto_esc_next:
+                    logging.info("Auto-ESC")
+                    pydirectinput.press("esc")
+                    auto_esc_next = now + auto_esc_interval_s
+
             if not state["monitoring"]:
                 time.sleep(0.1)
                 continue
@@ -1145,8 +1445,8 @@ def main() -> None:
             marker_rect = map_rect(roi_ref, ref_size, (render_x, render_y), (render_w, render_h))
             change_rect = map_rect(change_roi_ref, ref_size, (render_x, render_y), (render_w, render_h))
 
-            marker_img = capture.grab(marker_rect)
-            change_img = capture.grab(change_rect)
+            marker_img = capture.grab_auto(marker_rect, hwnd, capture_method)
+            change_img = capture.grab_auto(change_rect, hwnd, capture_method)
             if marker_img is None or change_img is None:
                 time.sleep(0.05)
                 continue
@@ -1214,6 +1514,8 @@ def main() -> None:
             if should_save:
                 _save_debug_frame(
                     capture,
+                    hwnd,
+                    capture_method,
                     debug_output_dir,
                     nonlocal_vars["frame_index"],
                     (origin_x, origin_y),

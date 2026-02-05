@@ -5,67 +5,17 @@ Press F8 to toggle tracking.
 """
 from __future__ import annotations
 
-import ctypes
-import os
-import sys
 import logging
+import os
 import time
-from ctypes import wintypes
-from typing import Any, Dict, Tuple
 
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-
-from engine.capture import ScreenCapture
-from engine.mapper import find_window, get_client_origin_and_size, is_window_minimized, set_process_dpi_awareness
 import keyboard
-import json
 
-CONFIG_PATH = os.path.join(PARENT_DIR, "config.json")
+from common import DEFAULT_CONFIG_PATH, get_capture_method, get_cursor_pos, get_render_context, load_config
+from engine.capture import ScreenCapture
+from engine.mapper import is_window_minimized, set_process_dpi_awareness
 DEFAULT_TRACK_MOUSE_HOTKEY = "f8"
 MOUSE_TRACK_INTERVAL_S = 0.2
-
-
-def _get_cursor_pos() -> Tuple[int, int]:
-    point = wintypes.POINT()
-    if ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
-        return int(point.x), int(point.y)
-    return 0, 0
-
-
-def _get_ref_size(config: Dict[str, Any]) -> Tuple[int, int]:
-    ref = config.get("reference_resolution", {})
-    return int(ref.get("w", 1920)), int(ref.get("h", 1080))
-
-
-def _compute_render_rect(
-    client_origin: Tuple[int, int],
-    client_size: Tuple[int, int],
-    ref_size: Tuple[int, int],
-    render_cfg: Dict[str, Any],
-) -> Tuple[int, int, int, int]:
-    mode = str(render_cfg.get("mode", "stretch")).lower()
-    client_w, client_h = client_size
-    ref_w, ref_h = ref_size
-    if mode == "manual":
-        offset = render_cfg.get("offset", {})
-        size = render_cfg.get("size", {})
-        width = int(size.get("w", 0)) or client_w
-        height = int(size.get("h", 0)) or client_h
-        off_x = int(offset.get("x", 0))
-        off_y = int(offset.get("y", 0))
-        return client_origin[0] + off_x, client_origin[1] + off_y, width, height
-    if mode == "fit":
-        if ref_w <= 0 or ref_h <= 0 or client_w <= 0 or client_h <= 0:
-            return client_origin[0], client_origin[1], client_w, client_h
-        scale = min(client_w / ref_w, client_h / ref_h)
-        render_w = int(round(ref_w * scale))
-        render_h = int(round(ref_h * scale))
-        off_x = int(round((client_w - render_w) / 2))
-        off_y = int(round((client_h - render_h) / 2))
-        return client_origin[0] + off_x, client_origin[1] + off_y, render_w, render_h
-    return client_origin[0], client_origin[1], client_w, client_h
 
 
 def main():
@@ -73,24 +23,13 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
     set_process_dpi_awareness()
 
-    if not os.path.exists(CONFIG_PATH):
-        logging.error("Config file not found: %s", CONFIG_PATH)
+    if not os.path.exists(DEFAULT_CONFIG_PATH):
+        logging.error("Config file not found: %s", DEFAULT_CONFIG_PATH)
         return
 
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        config = json.load(f)
-
-    target_cfg = config.get("target", {})
-    window_title = target_cfg.get("window_title_substring", "")
-    process_name = target_cfg.get("process_name", "") or None
-
-    hwnd = find_window(window_title, process_name)
-    if not hwnd:
-        logging.error("Could not find window with title containing: %s", window_title)
-        return
-
-    ref_size = _get_ref_size(config)
-    render_cfg = config.get("render_area", {})
+    config = load_config(DEFAULT_CONFIG_PATH)
+    capture_method = get_capture_method(config)
+    hwnd, ref_size, render_rect, _scale_x, _scale_y = get_render_context(config)
 
     capture = ScreenCapture()
     mouse_state = {
@@ -107,25 +46,18 @@ def main():
     keyboard.add_hotkey(DEFAULT_TRACK_MOUSE_HOTKEY, toggle_tracking)
 
     def log_mouse_position():
-        x, y = _get_cursor_pos()
+        x, y = get_cursor_pos()
         if is_window_minimized(hwnd):
             logging.warning("Window is minimized; mouse log skipped.")
             return
-        try:
-            origin_x, origin_y, client_w, client_h = get_client_origin_and_size(hwnd)
-        except Exception as exc:
-            logging.error("Failed to read window metrics: %s", exc)
-            return
-        render_x, render_y, render_w, render_h = _compute_render_rect(
-            (origin_x, origin_y), (client_w, client_h), ref_size, render_cfg
-        )
+        render_x, render_y, render_w, render_h = render_rect
         scale_x = render_w / ref_size[0] if ref_size[0] else 1.0
         scale_y = render_h / ref_size[1] if ref_size[1] else 1.0
         ref_x = int(round((x - render_x) / scale_x)) if scale_x else 0
         ref_y = int(round((y - render_y) / scale_y)) if scale_y else 0
 
         try:
-            pixel_img = capture.grab((x, y, 1, 1))
+            pixel_img = capture.grab_auto((x, y, 1, 1), hwnd, capture_method)
             if pixel_img is not None and pixel_img.size > 0:
                 b, g, r = pixel_img[0, 0]
                 rgb = (int(r), int(g), int(b))

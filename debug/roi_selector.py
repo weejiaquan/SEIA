@@ -6,34 +6,18 @@ Press hotkey to start selection, click top-left then bottom-right.
 from __future__ import annotations
 
 import os
-import sys
-import logging
-from typing import Optional, Tuple
+from typing import Tuple
 
 import keyboard
-import pydirectinput
 
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-
+from common import DEFAULT_CONFIG_PATH, compute_render_rect, get_cursor_pos, get_ref_size, load_config, start_mouse_poller
 from engine.mapper import find_window, get_client_origin_and_size, is_window_minimized, set_process_dpi_awareness
 
 
 # Hotkey to start ROI selection
 ROI_SELECT_HOTKEY = "ctrl+shift+r"
+CONFIG_PATH = DEFAULT_CONFIG_PATH
 
-
-def _get_cursor_pos() -> Tuple[int, int]:
-    """Get current cursor position."""
-    try:
-        import win32api
-        return win32api.GetCursorPos()
-    except ImportError:
-        import ctypes
-        point = ctypes.wintypes.POINT()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
-        return point.x, point.y
 
 
 def select_roi(hwnd: int, ref_size: Tuple[int, int], render_rect: Tuple[int, int, int, int]) -> None:
@@ -63,7 +47,7 @@ def select_roi(hwnd: int, ref_size: Tuple[int, int], render_rect: Tuple[int, int
             print("ERROR: Window is minimized!")
             return
         
-        x, y = _get_cursor_pos()
+        x, y = get_cursor_pos()
         
         # Convert to reference coordinates
         render_x, render_y, render_w, render_h = render_rect
@@ -108,61 +92,22 @@ def select_roi(hwnd: int, ref_size: Tuple[int, int], render_rect: Tuple[int, int
             print("Waiting for first click (top-left)...")
             print("="*60)
     
-    # Register click hotkey (using mouse button)
-    # We'll use a simple polling approach since keyboard doesn't handle mouse
-    import time
-    import threading
-    
-    last_click_time = 0
-    
-    def mouse_poller():
-        nonlocal last_click_time
-        import ctypes
-        while True:
-            time.sleep(0.05)
-            # Check if left mouse button is pressed
-            if ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000:
-                current_time = time.time()
-                # Debounce - only register if 0.3s passed since last click
-                if current_time - last_click_time > 0.3:
-                    last_click_time = current_time
-                    on_click()
-    
-    thread = threading.Thread(target=mouse_poller, daemon=True)
-    thread.start()
+    start_mouse_poller(on_click)
 
 
 def main():
-    """Main entry point."""
     set_process_dpi_awareness()
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+    if not os.path.exists(CONFIG_PATH):
+        raise FileNotFoundError(f"Missing config: {CONFIG_PATH}")
+    config = load_config(CONFIG_PATH)
+    target = config.get("target", {})
+    title_substring = target.get("window_title_substring", "")
+    process_name = target.get("process_name", "") or None
+    hwnd = find_window(title_substring, process_name)
+    if hwnd is None:
+        raise RuntimeError("Target window not found.")
     
-    # Load config
-    config_path = os.path.join(PARENT_DIR, "config.json")
-    if not os.path.exists(config_path):
-        print(f"ERROR: Config file not found: {config_path}")
-        return
-    
-    import json
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-    
-    # Find window
-    target_cfg = config.get("target", {})
-    window_title = target_cfg.get("window_title_substring", "")
-    
-    hwnd = find_window(window_title)
-    if not hwnd:
-        print(f"ERROR: Could not find window with title containing: '{window_title}'")
-        return
-    
-    print(f"Found window: {window_title}")
-    
-    # Get reference resolution
-    ref_cfg = config.get("reference_resolution", {})
-    ref_w = ref_cfg.get("w", 1920)
-    ref_h = ref_cfg.get("h", 1080)
-    ref_size = (ref_w, ref_h)
+    ref_size = get_ref_size(config)
     
     # Get render area
     try:
@@ -172,20 +117,13 @@ def main():
         return
     
     render_cfg = config.get("render_area", {})
-    mode = render_cfg.get("mode", "stretch")
-    
-    # Calculate render rect (simplified - using stretch mode)
-    if mode == "stretch":
-        render_rect = (origin_x, origin_y, client_w, client_h)
-    else:
-        # For fit/manual modes, this is simplified
-        render_rect = (origin_x, origin_y, client_w, client_h)
+    render_rect = compute_render_rect((origin_x, origin_y), (client_w, client_h), ref_size, render_cfg)
     
     print("\n" + "="*60)
     print("ROI RECTANGLE SELECTOR - READY")
     print("="*60)
     print(f"Hotkey: {ROI_SELECT_HOTKEY} - Start ROI selection")
-    print(f"Reference resolution: {ref_w}x{ref_h}")
+    print(f"Reference resolution: {ref_size[0]}x{ref_size[1]}")
     print(f"Window size: {client_w}x{client_h}")
     print("="*60)
     

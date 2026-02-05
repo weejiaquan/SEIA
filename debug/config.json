@@ -1,7 +1,7 @@
 {
   "target": {
-    "window_title_substring": "Blue Archive",
-    "process_name": ""
+    "window_title_substring": "",
+    "process_name": "BlueArchive.exe"
   },
   "reference_resolution": {
     "w": 1920,
@@ -18,11 +18,17 @@
       "h": 0
     }
   },
+  "window": {
+    "auto_resize": true,
+    "force_topmost": true
+  },
   "marker_detection": {
     "method": "template",
     "threshold": 0.3,
     "min_score_delta": 0.05,
-    "use_pixel_verification": false
+    "use_pixel_verification": false,
+    "multi_scale_range": 0.03,
+    "multi_scale_steps": 3
   },
   "input": {
     "mouse_motion": "instant",
@@ -33,5 +39,8 @@
   "debug": {
     "log": false,
     "screenshot": false
+  },
+  "capture": {
+    "method": "window_raise"
   }
 }

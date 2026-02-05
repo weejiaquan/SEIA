@@ -5,39 +5,12 @@ Useful for finding coords_offset parameters for action() calls.
 """
 from __future__ import annotations
 
-import os
-import sys
 import logging
+import os
 from typing import Tuple
-import time
-import threading
 
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-
-from engine.mapper import find_window, get_client_origin_and_size, is_window_minimized, set_process_dpi_awareness
-import json
-
-
-def _get_cursor_pos() -> Tuple[int, int]:
-    """Get current cursor position."""
-    try:
-        import win32api
-        return win32api.GetCursorPos()
-    except ImportError:
-        import ctypes
-        point = ctypes.wintypes.POINT()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
-        return point.x, point.y
-
-
-def _compute_render_rect(origin, client_size, ref_size, render_cfg):
-    """Compute render rectangle."""
-    mode = render_cfg.get("mode", "stretch")
-    if mode == "stretch":
-        return origin[0], origin[1], client_size[0], client_size[1]
-    return origin[0], origin[1], client_size[0], client_size[1]
+from common import DEFAULT_CONFIG_PATH, get_cursor_pos, get_render_context, load_config, start_mouse_poller
+from engine.mapper import is_window_minimized, set_process_dpi_awareness
 
 
 def calculate_offset(hwnd: int, ref_size: Tuple[int, int], render_rect: Tuple[int, int, int, int]) -> None:
@@ -62,7 +35,7 @@ def calculate_offset(hwnd: int, ref_size: Tuple[int, int], render_rect: Tuple[in
             print("ERROR: Window is minimized!")
             return
         
-        x, y = _get_cursor_pos()
+        x, y = get_cursor_pos()
         
         # Convert to reference coordinates
         render_x, render_y, render_w, render_h = render_rect
@@ -106,24 +79,7 @@ def calculate_offset(hwnd: int, ref_size: Tuple[int, int], render_rect: Tuple[in
             print("Waiting for first click...")
             print("="*60)
     
-    # Mouse polling
-    last_click_time = 0
-    
-    def mouse_poller():
-        nonlocal last_click_time
-        import ctypes
-        while True:
-            time.sleep(0.05)
-            # Check if left mouse button is pressed
-            if ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000:
-                current_time = time.time()
-                # Debounce - only register if 0.3s passed since last click
-                if current_time - last_click_time > 0.3:
-                    last_click_time = current_time
-                    on_click()
-    
-    thread = threading.Thread(target=mouse_poller, daemon=True)
-    thread.start()
+    start_mouse_poller(on_click)
 
 
 def main():
@@ -132,46 +88,18 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
     
     # Load config
-    config_path = os.path.join(PARENT_DIR, "config.json")
-    if not os.path.exists(config_path):
-        print(f"ERROR: Config file not found: {config_path}")
+    if not os.path.exists(DEFAULT_CONFIG_PATH):
+        print(f"ERROR: Config file not found: {DEFAULT_CONFIG_PATH}")
         return
-    
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-    
-    # Find window
-    target_cfg = config.get("target", {})
-    window_title = target_cfg.get("window_title_substring", "")
-    
-    hwnd = find_window(window_title)
-    if not hwnd:
-        print(f"ERROR: Could not find window with title containing: '{window_title}'")
-        return
-    
-    print(f"Found window: {window_title}")
-    
-    # Get reference resolution
-    ref_cfg = config.get("reference_resolution", {})
-    ref_w = ref_cfg.get("w", 1920)
-    ref_h = ref_cfg.get("h", 1080)
-    ref_size = (ref_w, ref_h)
-    
-    # Get render area
-    try:
-        origin_x, origin_y, client_w, client_h = get_client_origin_and_size(hwnd)
-    except Exception as e:
-        print(f"ERROR: Failed to get window metrics: {e}")
-        return
-    
-    render_cfg = config.get("render_area", {})
-    render_rect = _compute_render_rect((origin_x, origin_y), (client_w, client_h), ref_size, render_cfg)
+
+    config = load_config(DEFAULT_CONFIG_PATH)
+    hwnd, ref_size, render_rect, _scale_x, _scale_y = get_render_context(config)
     
     print("\n" + "="*60)
     print("OFFSET CALCULATOR - READY")
     print("="*60)
-    print(f"Reference resolution: {ref_w}x{ref_h}")
-    print(f"Window size: {client_w}x{client_h}")
+    print(f"Reference resolution: {ref_size[0]}x{ref_size[1]}")
+    print(f"Window size: {render_rect[2]}x{render_rect[3]}")
     print("="*60)
     
     # Start offset calculation
