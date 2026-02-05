@@ -20,6 +20,22 @@ from .core import AutomationEngine
 from .mapper import set_window_topmost
 from .verify import add_pixel_verification
 
+# Import utility functions for re-export
+from .utils import (
+    clean_template_name,
+    export_csv,
+    is_debug_mode,
+    load_script_config,
+)
+from .scan_utils import (
+    collect_unique_matches,
+    detect_stop_marker,
+    filter_cells_by_stop_marker,
+    save_scan_results,
+    scan_grid,
+    stitch_debug_visualizations,
+)
+
 
 # ANSI color codes for terminal
 class Color:
@@ -528,6 +544,88 @@ def hold_key(key: str, duration: float, repeat: int = 1, delay_between: float = 
         pydirectinput.keyUp(key)
         if i < repeat - 1 and delay_between > 0:
             sleep(delay_between)
+
+
+def drag(
+    start_ref: Tuple[int, int],
+    end_ref: Tuple[int, int],
+    hold_s: float = 0.0,
+    drag_duration_s: float = 0.5,
+    settle_s: float = 0.0,
+    end_sleep_s: float = 0.0,
+    button: str = "left",
+) -> None:
+    """
+    Drag from start to end position in reference coordinates.
+    
+    Args:
+        start_ref: Starting (x, y) in reference space (1920x1080)
+        end_ref: Ending (x, y) in reference space
+        hold_s: How long to hold at start before dragging (default 0)
+        drag_duration_s: Duration of the drag motion (default 0.5s)
+        settle_s: How long to hold at end before releasing (default 0)
+        end_sleep_s: Additional sleep after releasing (default 0)
+        button: Mouse button to use ("left" or "right", default "left")
+    """
+    engine = _ensure_engine()
+    _log_action(
+        f"drag start_ref={start_ref} end_ref={end_ref} "
+        f"hold={hold_s:.2f}s drag={drag_duration_s:.2f}s settle={settle_s:.2f}s button={button}"
+    )
+    engine.drag_ref(
+        start_ref,
+        end_ref,
+        hold_s=hold_s,
+        drag_duration_s=drag_duration_s,
+        settle_s=settle_s,
+        button=button,
+    )
+    if end_sleep_s > 0:
+        sleep(end_sleep_s)
+
+
+def scroll(
+    start_ref: Tuple[int, int],
+    end_ref: Tuple[int, int],
+    hold_s: float = 0.0,
+    drag_duration_s: float = 1.0,
+    settle_s: float = 1.5,
+    end_sleep_s: float = 0.5,
+    button: str = "left",
+    log: bool = True,
+) -> None:
+    """
+    Scroll by dragging (common pattern for scrolling lists/grids).
+    
+    This is a convenience wrapper around drag() with defaults tuned for scrolling:
+    - Longer drag duration for smooth motion (1.0s default)
+    - Longer settle time to prevent momentum (1.5s default)
+    - Post-scroll sleep for stability (0.5s default)
+    
+    Args:
+        start_ref: Starting (x, y) in reference space (1920x1080)
+        end_ref: Ending (x, y) in reference space
+        hold_s: How long to hold at start before dragging (default 0)
+        drag_duration_s: Duration of the drag motion (default 1.0s)
+        settle_s: How long to hold at end before releasing (default 1.5s)
+        end_sleep_s: Additional sleep after releasing (default 0.5s)
+        button: Mouse button to use ("left" or "right", default "left")
+        log: Whether to log the scroll action (default True)
+    """
+    if log:
+        _log_action(
+            f"scroll {start_ref} -> {end_ref} "
+            f"(duration={drag_duration_s:.2f}s, settle={settle_s:.2f}s)"
+        )
+    drag(
+        start_ref=start_ref,
+        end_ref=end_ref,
+        hold_s=hold_s,
+        drag_duration_s=drag_duration_s,
+        settle_s=settle_s,
+        end_sleep_s=end_sleep_s,
+        button=button,
+    )
 
 
 def _fail(message: str, exit_code: int = 1) -> None:
@@ -1439,3 +1537,211 @@ def press_until_optional(
         if time.monotonic() >= deadline:
             print(_colored(f"[runtime] ✗ press_until_optional result image={image_name} ok=0", Color.RED + Color.BOLD), flush=True)
             return False
+
+
+# ============================================================================
+# CLIP-based scanning functions
+# ============================================================================
+
+
+def present_clip(
+    template_path: str,
+    threshold: float = 0.75,
+    roi_ref: Tuple[int, int, int, int] | None = None,
+    log: bool = True,
+) -> bool:
+    """
+    Check if a template is present using CLIP similarity matching.
+
+    Args:
+        template_path: Path to template image
+        threshold: CLIP similarity threshold (0.0-1.0)
+        roi_ref: Optional ROI in reference coordinates (x, y, w, h)
+        log: If True, log the result
+
+    Returns:
+        True if template matches above threshold
+    """
+    from .clip_scanner import match_single_clip
+
+    engine = _ensure_engine()
+    image_path = _resolve_path(template_path)
+
+    # Capture screen
+    capture = engine.capture_screen()
+    if capture is None or capture.size == 0:
+        if log:
+            _log_action(f"present_clip failed: capture failed")
+        return False
+
+    # Convert ROI from reference to screen coordinates if provided
+    roi = None
+    if roi_ref is not None:
+        roi = engine.map_roi_to_screen(roi_ref)
+
+    score, matched = match_single_clip(capture, image_path, threshold=threshold, roi=roi)
+
+    if log:
+        _log_action(f"present_clip template={os.path.basename(template_path)} score={score:.3f} matched={matched}")
+
+    return matched
+
+
+def scan_templates_clip(
+    template_folder: str | None = None,
+    threshold: float = 0.75,
+    roi_ref: Tuple[int, int, int, int] | None = None,
+    grid_size: Tuple[int, int] = (6, 2),
+    row_gap: int = 0,
+    col_gap: int = 0,
+    cache_file: str | None = None,
+) -> dict:
+    """
+    Scan screen against templates using CLIP-based matching.
+
+    Divides the capture (or ROI) into a grid and matches each cell against
+    all templates in the folder or cache.
+
+    Args:
+        template_folder: Path to folder containing template images.
+                        Optional if cache_file exists.
+        threshold: CLIP similarity threshold (0.0-1.0)
+        roi_ref: Optional ROI in reference coordinates (x, y, w, h)
+        grid_size: (columns, rows) to divide the capture into
+        row_gap: Pixels of gap between rows to exclude
+        col_gap: Pixels of gap between columns to exclude
+        cache_file: Optional path to embedding cache file.
+                   If template_folder is None, must exist for cache-only mode.
+
+    Returns:
+        Dict with matches, cells, and scan metadata
+    """
+    from .clip_scanner import build_embedding_cache, load_embedding_cache, scan_with_clip
+
+    engine = _ensure_engine()
+
+    # Capture screen
+    capture = engine.capture_screen()
+    if capture is None or capture.size == 0:
+        return {"error": "capture failed", "matches": [], "cells": []}
+
+    # Crop to ROI if specified (in reference coordinates)
+    if roi_ref is not None:
+        screen_roi = engine.map_roi_to_screen(roi_ref)
+        x, y, w, h = screen_roi
+        # Ensure bounds are valid
+        cap_h, cap_w = capture.shape[:2]
+        x = max(0, min(x, cap_w - 1))
+        y = max(0, min(y, cap_h - 1))
+        w = min(w, cap_w - x)
+        h = min(h, cap_h - y)
+        capture = capture[y:y+h, x:x+w]
+
+    # Determine cache file location
+    if cache_file is None:
+        cache_file = os.path.join(os.getcwd(), "cache", "templates.npz")
+
+    # Smart mode: use cache if valid, auto-rebuild if templates changed
+    if cache_only is None:
+        if template_folder is None:
+            # No template folder - try cache only
+            if os.path.exists(cache_file):
+                cache = load_embedding_cache(cache_file)
+                if cache is not None:
+                    print(f"[CLIP] Using cache: {cache_file}", flush=True)
+                else:
+                    return {
+                        "error": f"cache corrupted: {cache_file}. Provide template_folder to rebuild.",
+                        "matches": [],
+                        "cells": []
+                    }
+            else:
+                return {
+                    "error": f"cache not found: {cache_file}. Provide template_folder to build cache.",
+                    "matches": [],
+                    "cells": []
+                }
+        else:
+            # Template folder provided - use smart rebuild
+            # build_embedding_cache checks if cache is valid and auto-rebuilds if needed
+            folder_path = _resolve_path(template_folder)
+            cache = build_embedding_cache(folder_path, cache_file=cache_file)
+    
+    elif cache_only:
+        # Cache-only mode: load existing cache
+        cache = load_embedding_cache(cache_file)
+        if cache is None:
+            return {
+                "error": f"cache not found: {cache_file}",
+                "matches": [],
+                "cells": []
+            }
+    else:
+        # Template mode: always use template folder and build/update cache
+        if template_folder is None:
+            return {
+                "error": "cache_only=False but no template_folder provided",
+                "matches": [],
+                "cells": []
+            }
+        folder_path = _resolve_path(template_folder)
+        cache = build_embedding_cache(folder_path, cache_file=cache_file)
+
+    # Run CLIP scan
+    results = scan_with_clip(
+        capture_image=capture,
+        cache=cache,
+        grid_size=grid_size,
+        roi_ref=roi_ref,
+        threshold=threshold,
+        row_gap=row_gap,
+        col_gap=col_gap,
+    )
+
+    return results
+
+
+def scan_screen_clip(
+    template_folder: str,
+    threshold: float = 0.75,
+    cache_file: str | None = None,
+) -> dict:
+    """
+    Full-screen CLIP scan against all templates.
+
+    Compares the entire screen capture against all template embeddings.
+
+    Args:
+        template_folder: Path to folder containing template images
+        threshold: CLIP similarity threshold (0.0-1.0)
+        cache_file: Optional path to embedding cache file
+
+    Returns:
+        Dict with matches sorted by score
+    """
+    from .clip_scanner import build_embedding_cache, scan_fullscreen
+
+    engine = _ensure_engine()
+
+    # Capture screen
+    capture = engine.capture_screen()
+    if capture is None or capture.size == 0:
+        return {"error": "capture failed", "matches": []}
+
+    # Resolve template folder path
+    folder_path = _resolve_path(template_folder)
+
+    # Build or load embedding cache
+    if cache_file is None:
+        cache_file = os.path.join(os.getcwd(), "cache", "templates.npz")
+
+    cache = build_embedding_cache(folder_path, cache_file=cache_file)
+
+    # Run full-screen scan
+    results = scan_fullscreen(
+        capture_image=capture,
+        cache=cache,
+        threshold=threshold,
+    )
+
+    return results

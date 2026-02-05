@@ -32,6 +32,14 @@ from .mapper import (
     set_window_client_size,
 )
 from .debug_draw import draw_match_rect, draw_verification_results
+from .ocr import (
+    OCREngine,
+    TextResult,
+    available_engines,
+    create_ocr_engine,
+    parse_number,
+    sort_by_position,
+)
 from .verify import (
     verify_match,
     add_pixel_verification,
@@ -95,6 +103,8 @@ class AutomationEngine:
         self._hwnd: Optional[int] = None
         self._capture = ScreenCapture()
         self._templates: Dict[str, TemplateDetector | FeatureDetector] = {}
+        self._ocr_engines: Dict[str, OCREngine] = {}
+        self._ocr_config: Dict[str, Any] = {}
         self._use_pixel_verification = False
         self._debug_screenshot = False
         self._debug_output_dir = "debug_out"
@@ -157,6 +167,13 @@ class AutomationEngine:
         self._capture_method = capture_method
         poll_ms = self._config.get("poll_interval_ms", 50)
         self._poll_interval = max(0.01, float(poll_ms) / 1000.0)
+        ocr_cfg = self._config.get("ocr", {})
+        self._ocr_config = {
+            "engine": str(ocr_cfg.get("engine", "paddleocr")),
+            "languages": list(ocr_cfg.get("languages", ["ja", "en"])),
+            "gpu": bool(ocr_cfg.get("gpu", True)),
+            "confidence_threshold": float(ocr_cfg.get("confidence_threshold", 0.5)),
+        }
 
     def _debug_path(self, debug_dir: str, prefix: str, image_filename: str) -> str:
         if self._debug_keep_history:
@@ -169,6 +186,7 @@ class AutomationEngine:
     def reload(self) -> None:
         self._load_config()
         self._templates.clear()
+        self._ocr_engines.clear()
         self._hwnd = None
         self._resized_once = False
 
@@ -551,6 +569,86 @@ class AutomationEngine:
             is not None
         )
 
+    def image_present_clip(
+        self,
+        image_path: str,
+        roi_ref: Optional[Tuple[int, int, int, int]] = None,
+        threshold: float = 0.75,
+    ) -> Tuple[bool, float]:
+        """
+        Check if image is present using CLIP matching.
+
+        More robust than template matching for UI elements affected by
+        anti-aliasing, compression, or rendering variations.
+
+        Args:
+            image_path: Path to template image
+            roi_ref: Optional ROI in reference coordinates (x, y, w, h)
+            threshold: CLIP similarity threshold (0.0-1.0), default 0.75
+
+        Returns:
+            (present, score) tuple:
+            - present: True if CLIP similarity >= threshold
+            - score: CLIP similarity score (0.0-1.0)
+        """
+        from .clip_scanner import match_single_clip
+
+        _, _, render_rect, _scale_x, _scale_y = self._get_window_metrics()
+        _roi_screen, image = self._capture_roi(roi_ref, render_rect)
+        if image is None:
+            return False, 0.0
+
+        score, matched = match_single_clip(
+            capture_image=image,
+            template_path=image_path,
+            threshold=threshold,
+            roi=None,  # Already cropped by _capture_roi
+        )
+        return matched, score
+
+    def wait_for_image_clip(
+        self,
+        image_path: str,
+        roi_ref: Optional[Tuple[int, int, int, int]] = None,
+        threshold: float = 0.75,
+        timeout_s: float = 10.0,
+        poll_interval_s: float = 0.1,
+        stop_check: Optional[Callable[[], bool]] = None,
+    ) -> Tuple[bool, float]:
+        """
+        Wait for image to appear using CLIP matching.
+
+        Args:
+            image_path: Path to template image
+            roi_ref: Optional ROI in reference coordinates
+            threshold: CLIP similarity threshold (0.0-1.0)
+            timeout_s: Maximum wait time in seconds
+            poll_interval_s: Time between checks
+            stop_check: Optional callback to check for stop request
+
+        Returns:
+            (found, score) tuple:
+            - found: True if image appeared within timeout
+            - score: Final CLIP score (highest seen, or last check)
+        """
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        best_score = 0.0
+
+        while True:
+            if stop_check is not None and stop_check():
+                return False, best_score
+
+            matched, score = self.image_present_clip(image_path, roi_ref, threshold)
+            best_score = max(best_score, score)
+
+            if matched:
+                return True, score
+
+            if time.monotonic() >= deadline:
+                return False, best_score
+
+            time.sleep(poll_interval_s)
+
     def wait_for_image(
         self,
         image_path: str,
@@ -900,3 +998,323 @@ class AutomationEngine:
             pydirectinput.click()
         except TypeError:
             pydirectinput.click(int(x), int(y))
+
+    # -- OCR -----------------------------------------------------------------
+
+    def _get_ocr_engine(self, name: str) -> Optional[OCREngine]:
+        """Get or lazily initialize a cached OCR engine."""
+        engine = self._ocr_engines.get(name)
+        if engine is not None:
+            return engine
+        try:
+            engine = create_ocr_engine(name)
+        except KeyError:
+            logging.warning("Unknown OCR engine: %s", name)
+            return None
+        try:
+            engine.initialize(
+                languages=self._ocr_config.get("languages", ["ja", "en"]),
+                use_gpu=self._ocr_config.get("gpu", True),
+            )
+        except ImportError:
+            logging.warning("OCR engine %s not installed, skipping", name)
+            return None
+        except Exception as exc:
+            logging.warning("OCR engine %s failed to initialize: %s", name, exc)
+            return None
+        self._ocr_engines[name] = engine
+        return engine
+
+    def _get_active_ocr_engines(self) -> list[OCREngine]:
+        """Resolve which OCR engines to use from config."""
+        engine_setting = self._ocr_config.get("engine", "paddleocr")
+        if engine_setting == "all":
+            engines: list[OCREngine] = []
+            for name in available_engines():
+                eng = self._get_ocr_engine(name)
+                if eng is not None:
+                    engines.append(eng)
+            return engines
+        eng = self._get_ocr_engine(engine_setting)
+        return [eng] if eng is not None else []
+
+    def read_text_roi(
+        self,
+        roi_ref: Optional[Tuple[int, int, int, int]] = None,
+        confidence_threshold: Optional[float] = None,
+        debug_context: Optional[dict[str, object]] = None,
+    ) -> list[TextResult]:
+        """Capture an ROI and run OCR, returning filtered TextResults."""
+        _, _, render_rect, _scale_x, _scale_y = self._get_window_metrics()
+        roi_screen, image = self._capture_roi(roi_ref, render_rect)
+        if image is None:
+            return []
+        threshold = confidence_threshold if confidence_threshold is not None else self._ocr_config.get("confidence_threshold", 0.5)
+        engines = self._get_active_ocr_engines()
+        if not engines:
+            logging.warning("No OCR engines available")
+            return []
+        all_results: list[TextResult] = []
+        for engine in engines:
+            try:
+                results = engine.read(image)
+                all_results.extend(results)
+            except Exception as exc:
+                logging.warning("OCR engine %s failed: %s", engine.name, exc)
+        # Filter by confidence
+        filtered = [r for r in all_results if r.confidence >= threshold]
+        # Sort by position
+        filtered = sort_by_position(filtered)
+        if self._debug_always_capture or self._debug_screenshot:
+            self._save_ocr_debug(image, filtered, roi_ref, roi_screen, debug_context)
+        return filtered
+
+    def read_text_rois(
+        self,
+        rois: Dict[str, Tuple[int, int, int, int]],
+        confidence_threshold: Optional[float] = None,
+        debug_context: Optional[dict[str, object]] = None,
+        fallback_per_roi: bool = False,
+    ) -> Dict[str, list[TextResult]]:
+        """Read text from multiple ROIs using a single OCR pass when possible."""
+        if not rois:
+            return {}
+        cleaned: Dict[str, Tuple[int, int, int, int]] = {}
+        for key, roi in rois.items():
+            if roi is None:
+                continue
+            try:
+                x, y, w, h = (int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3]))
+            except Exception:
+                logging.warning("Invalid ROI for key %s: %s", key, roi)
+                continue
+            if w <= 0 or h <= 0:
+                logging.warning("Skipping zero-size ROI for key %s: %s", key, roi)
+                continue
+            cleaned[str(key)] = (x, y, w, h)
+        if not cleaned:
+            return {}
+        if len(cleaned) == 1:
+            only_key = next(iter(cleaned))
+            results = self.read_text_roi(
+                roi_ref=cleaned[only_key],
+                confidence_threshold=confidence_threshold,
+                debug_context=debug_context,
+            )
+            return {only_key: results}
+
+        min_x = min(r[0] for r in cleaned.values())
+        min_y = min(r[1] for r in cleaned.values())
+        max_x = max(r[0] + r[2] for r in cleaned.values())
+        max_y = max(r[1] + r[3] for r in cleaned.values())
+        union_ref = (min_x, min_y, max_x - min_x, max_y - min_y)
+
+        _, _, render_rect, _scale_x, _scale_y = self._get_window_metrics()
+        union_screen, image = self._capture_roi(union_ref, render_rect)
+        if image is None:
+            return {key: [] for key in cleaned}
+
+        threshold = confidence_threshold if confidence_threshold is not None else self._ocr_config.get("confidence_threshold", 0.5)
+        engines = self._get_active_ocr_engines()
+        if not engines:
+            logging.warning("No OCR engines available")
+            return {key: [] for key in cleaned}
+
+        all_results: list[TextResult] = []
+        for engine in engines:
+            try:
+                results = engine.read(image)
+                all_results.extend(results)
+            except Exception as exc:
+                logging.warning("OCR engine %s failed: %s", engine.name, exc)
+
+        filtered = [r for r in all_results if r.confidence >= threshold]
+        if not filtered:
+            return {key: [] for key in cleaned}
+
+        with_bbox = [r for r in filtered if r.bbox is not None]
+        if not with_bbox:
+            logging.warning("OCR multi-ROI requires bbox results (PaddleOCR/EasyOCR). No bbox available.")
+            return {key: [] for key in cleaned}
+
+        if self._debug_always_capture or self._debug_screenshot:
+            self._save_ocr_debug(image, with_bbox, union_ref, union_screen, debug_context)
+
+        render_origin = (render_rect[0], render_rect[1])
+        render_size = (render_rect[2], render_rect[3])
+        roi_rel_map: Dict[str, Tuple[int, int, int, int]] = {}
+        for key, roi in cleaned.items():
+            roi_screen = map_rect(roi, self._ref_size, render_origin, render_size)
+            rel_x = roi_screen[0] - union_screen[0]
+            rel_y = roi_screen[1] - union_screen[1]
+            rel_w = roi_screen[2]
+            rel_h = roi_screen[3]
+            if rel_x < 0:
+                rel_w += rel_x
+                rel_x = 0
+            if rel_y < 0:
+                rel_h += rel_y
+                rel_y = 0
+            if rel_x + rel_w > union_screen[2]:
+                rel_w = max(0, union_screen[2] - rel_x)
+            if rel_y + rel_h > union_screen[3]:
+                rel_h = max(0, union_screen[3] - rel_y)
+            roi_rel_map[key] = (int(rel_x), int(rel_y), int(rel_w), int(rel_h))
+
+        results_by_roi: Dict[str, list[TextResult]] = {key: [] for key in cleaned}
+        for key, roi_rel in roi_rel_map.items():
+            rx, ry, rw, rh = roi_rel
+            if rw <= 0 or rh <= 0:
+                continue
+            for r in with_bbox:
+                if r.bbox is None:
+                    continue
+                bx, by, bw, bh = r.bbox
+                cx = bx + bw * 0.5
+                cy = by + bh * 0.5
+                if rx <= cx < rx + rw and ry <= cy < ry + rh:
+                    adj_bbox = (int(bx - rx), int(by - ry), int(bw), int(bh))
+                    results_by_roi[key].append(TextResult(
+                        text=r.text,
+                        confidence=r.confidence,
+                        bbox=adj_bbox,
+                        engine_name=r.engine_name,
+                    ))
+            results_by_roi[key] = sort_by_position(results_by_roi[key])
+
+        return results_by_roi
+
+    def read_number_roi(
+        self,
+        roi_ref: Optional[Tuple[int, int, int, int]] = None,
+        confidence_threshold: Optional[float] = None,
+        debug_context: Optional[dict[str, object]] = None,
+    ) -> Optional[float]:
+        """Capture an ROI, run OCR, and parse a number from the results.
+
+        When multiple engines return results, each engine's text is parsed
+        independently and the highest-confidence engine's number is used.
+        This avoids cross-engine concatenation errors.
+        """
+        results = self.read_text_roi(
+            roi_ref=roi_ref,
+            confidence_threshold=confidence_threshold,
+            debug_context=debug_context,
+        )
+        if not results:
+            return None
+        # Group results by engine, parse each independently
+        by_engine: dict[str, list[TextResult]] = {}
+        for r in results:
+            by_engine.setdefault(r.engine_name, []).append(r)
+        best_number: Optional[float] = None
+        best_confidence: float = -1.0
+        for engine_name, engine_results in by_engine.items():
+            combined = " ".join(r.text for r in engine_results)
+            number = parse_number(combined)
+            if number is not None:
+                avg_conf = sum(r.confidence for r in engine_results) / len(engine_results)
+                if avg_conf > best_confidence:
+                    best_confidence = avg_conf
+                    best_number = number
+        return best_number
+
+    def read_number_rois(
+        self,
+        rois: Dict[str, Tuple[int, int, int, int]],
+        confidence_threshold: Optional[float] = None,
+        debug_context: Optional[dict[str, object]] = None,
+        fallback_per_roi: bool = False,
+    ) -> Dict[str, Optional[float]]:
+        """Read numbers from multiple ROIs using a single OCR pass when possible."""
+        results_by_roi = self.read_text_rois(
+            rois=rois,
+            confidence_threshold=confidence_threshold,
+            debug_context=debug_context,
+            fallback_per_roi=fallback_per_roi,
+        )
+        values: Dict[str, Optional[float]] = {}
+        for key, results in results_by_roi.items():
+            if not results:
+                values[key] = None
+                continue
+            by_engine: dict[str, list[TextResult]] = {}
+            for r in results:
+                by_engine.setdefault(r.engine_name, []).append(r)
+            best_number: Optional[float] = None
+            best_confidence: float = -1.0
+            for engine_name, engine_results in by_engine.items():
+                combined = " ".join(r.text for r in engine_results)
+                number = parse_number(combined)
+                if number is not None:
+                    avg_conf = sum(r.confidence for r in engine_results) / len(engine_results)
+                    if avg_conf > best_confidence:
+                        best_confidence = avg_conf
+                        best_number = number
+            values[key] = best_number
+        return values
+
+    def _save_ocr_debug(
+        self,
+        image: Any,
+        results: list[TextResult],
+        roi_ref: Optional[Tuple[int, int, int, int]],
+        roi_screen: Tuple[int, int, int, int],
+        debug_context: Optional[dict[str, object]],
+    ) -> None:
+        """Save annotated OCR debug screenshot and metadata JSON."""
+        try:
+            import cv2 as _cv2
+
+            debug_img = image.copy()
+            colors = [
+                (0, 255, 0),    # green
+                (255, 165, 0),  # orange (BGR)
+                (255, 0, 0),    # blue
+                (0, 255, 255),  # yellow
+            ]
+            engine_color_map: dict[str, Tuple[int, int, int]] = {}
+            color_idx = 0
+            for r in results:
+                if r.engine_name not in engine_color_map:
+                    engine_color_map[r.engine_name] = colors[color_idx % len(colors)]
+                    color_idx += 1
+                color = engine_color_map[r.engine_name]
+                if r.bbox is not None:
+                    bx, by, bw, bh = r.bbox
+                    _cv2.rectangle(debug_img, (bx, by), (bx + bw, by + bh), color, 2)
+                    label = f"{r.engine_name}: {r.text} ({r.confidence:.2f})"
+                    _cv2.putText(
+                        debug_img, label,
+                        (bx, max(12, by - 4)),
+                        _cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1,
+                    )
+
+            debug_dir = self._debug_output_dir
+            if not os.path.isabs(debug_dir):
+                debug_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), debug_dir)
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_path = self._debug_path(debug_dir, "ocr", "result.png")
+            _cv2.imwrite(debug_path, debug_img)
+            self._write_debug_meta(
+                debug_path,
+                {
+                    "type": "ocr",
+                    "roi_ref": _to_list(roi_ref),
+                    "roi_screen": _to_list(roi_screen),
+                    "results": [
+                        {
+                            "text": r.text,
+                            "confidence": r.confidence,
+                            "bbox": list(r.bbox) if r.bbox else None,
+                            "engine": r.engine_name,
+                        }
+                        for r in results
+                    ],
+                    "context": debug_context,
+                    "timestamp": time.time(),
+                },
+            )
+            logging.info("Debug OCR screenshot saved: %s", debug_path)
+        except Exception as exc:
+            logging.debug("Failed to save OCR debug screenshot: %s", exc)

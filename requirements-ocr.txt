@@ -1,0 +1,4 @@
+paddleocr>=2.7.0
+paddlepaddle>=2.5.0
+manga-ocr>=0.1.8
+easyocr>=1.7.0
